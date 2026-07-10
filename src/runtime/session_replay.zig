@@ -3,8 +3,9 @@
 //!
 //! The journal is the world: the app's effects channel is armed into
 //! replay mode FIRST (fake executor — `fx.spawn`/`fx.fetch`/file/
-//! clipboard requests park in their slots; no process, network, file, or
-//! pasteboard is ever touched), then records replay in file order —
+//! clipboard/external requests park in their slots; no process, network,
+//! file, pasteboard, or live application adapter is ever touched), then
+//! records replay in file order —
 //! effect results feed the parked requests, events dispatch through
 //! `Runtime.dispatchPlatformEvent` exactly as the platform once did, and
 //! checkpoints compare the live state fingerprint (and screenshot pixel
@@ -20,11 +21,12 @@
 //! model, so both must be deterministic. A violation shows up here as
 //! the first mismatching checkpoint.
 //!
-//! Divergence is loud and specific: a fed effect result whose key has no
+//! Divergence is loud and specific: a fed effect result with no matching
 //! parked request (`ReplayEffectDivergence`) means update spawned
-//! different effects than the recording — usually nondeterminism outside
-//! the effect boundary; a fingerprint mismatch names the event ordinal
-//! and frame where state first differed.
+//! different effects than the recording. External effects additionally
+//! match request id, key, kind, and request-payload SHA-256 before a result
+//! is fed. A fingerprint mismatch names the event ordinal and frame where
+//! state first differed.
 
 const std = @import("std");
 const canvas = @import("canvas");
@@ -39,9 +41,8 @@ pub const ReplayError = error{
     /// The journal's automation protocol version differs from this
     /// build's — the recording binary and this one are skewed.
     ReplayProtocolMismatch,
-    /// A journaled effect result found no parked request with its key:
-    /// the replayed updates issued different effects than the recorded
-    /// ones did.
+    /// A journaled effect result found no matching parked request. For
+    /// external effects this includes key/kind/request-payload identity.
     ReplayEffectDivergence,
     /// The app registered no replay hook (`App.replay_fn`), but the
     /// journal carries effect results that need one.
@@ -181,7 +182,10 @@ fn replaySessionWithBridges(
                     continue;
                 }
                 app.replayControl(.{ .feed = effect }) catch |err| switch (err) {
-                    error.EffectNotFound => {
+                    error.EffectNotFound,
+                    error.ExternalEffectStaleResult,
+                    error.ExternalEffectReplayMismatch,
+                    => {
                         std.debug.print(
                             "replay diverged after event {d}: journaled {s} result for effect key {d} has no matching pending request - the replayed updates issued different effects than the recording (nondeterminism outside the effect boundary?)\n",
                             .{ report.events_replayed, @tagName(effect.kind), effect.key },
@@ -234,9 +238,8 @@ fn replaySessionWithBridges(
 
 /// Journaled results that regenerate deterministically from the
 /// replayed updates themselves — feeding them would double-deliver:
-/// rejections (the same over-capacity/duplicate-key validation refuses
-/// again, loop-side) and fx-timer Msgs (real fires replay through the
-/// journaled platform `.timer` events; rejections regenerate).
+/// loop-side rejections from the legacy effect APIs and fx-timer Msgs
+/// (real fires replay through journaled platform `.timer` events).
 fn effectRegeneratesUnderReplay(record: journal.EffectResultRecord) bool {
     return switch (record.kind) {
         .timer => true,
@@ -249,6 +252,7 @@ fn effectRegeneratesUnderReplay(record: journal.EffectResultRecord) bool {
         // position ticks, completions, platform failures — is an
         // external input and must be fed.
         .audio => record.audio_kind == .rejected,
+        .external => false,
         .line, .clock => false,
     };
 }

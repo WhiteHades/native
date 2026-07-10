@@ -6,11 +6,12 @@
 //! a session header, every dispatched platform event (payload + implicit
 //! ordinal), every effect RESULT the drain delivered to `update` (fetch
 //! response bytes, subprocess lines and exits, file reads, clipboard
-//! reads), and verification checkpoints (state fingerprints per published
+//! reads, application-defined external results), and verification
+//! checkpoints (state fingerprints per published
 //! frame, plus pixel hashes at screenshot marks). Replaying the journal
 //! through the same dispatch path — with effects stubbed from the
-//! journaled results, so no process, network, file, or clipboard is
-//! touched — reproduces the same model states.
+//! journaled results, so no process, network, file, clipboard, or live
+//! application adapter is touched — reproduces the same model states.
 //!
 //! THE INIT CONTRACT (v1, loud on purpose): the initial model is NOT
 //! serialized. Replay re-runs the app's own model init and `init_fx`,
@@ -70,8 +71,11 @@ pub const magic = "NSDKSJNL";
 /// enum orders bumps this; readers refuse other versions loudly rather
 /// than misreading yesterday's shape. v2 added the stream `buffering`
 /// flag to audio event and audio effect records; v3 added the spectrum
-/// band bytes to both (and the `.spectrum` audio kind).
-pub const format_version: u32 = 3;
+/// band bytes to both (and the `.spectrum` audio kind); v4 added external
+/// request ids, operation kinds, and outcomes to effect records; v5 adds
+/// the external request-payload SHA-256 identity; v6 adds SDK-owned
+/// adapter-unavailable and submit-failed external outcomes.
+pub const format_version: u32 = 6;
 
 // ------------------------------------------------------------- budgets
 //
@@ -832,6 +836,10 @@ pub fn encodeEffect(record: EffectResultRecord, buffer: []u8) JournalError![]con
     try cursor.writeBool(record.audio_playing);
     try cursor.writeBool(record.audio_buffering);
     try cursor.writeBytes(&record.audio_bands);
+    try cursor.writeInt(u64, record.external_request_id);
+    try cursor.writeInt(u32, record.external_kind);
+    try cursor.writeBytes(&record.external_request_hash);
+    try cursor.writeEnum(record.external_outcome);
     return buffer[0..cursor.len];
 }
 
@@ -864,6 +872,10 @@ pub fn decodeEffect(bytes: []const u8) JournalError!EffectResultRecord {
         .audio_buffering = try cursor.readBool(),
     };
     @memcpy(&record.audio_bands, try cursor.readBytes(record.audio_bands.len));
+    record.external_request_id = try cursor.readInt(u64);
+    record.external_kind = try cursor.readInt(u32);
+    @memcpy(&record.external_request_hash, try cursor.readBytes(record.external_request_hash.len));
+    record.external_outcome = try cursor.readEnum(runtime_effects.EffectExternalOutcome);
     if (!cursor.done()) return error.JournalCorrupt;
     return record;
 }
@@ -1343,6 +1355,24 @@ test "effect codec round-trips payloads and outcomes" {
     const spectrum_decoded = try decodeEffect(spectrum_encoded);
     try testing.expectEqual(runtime_effects.EffectAudioEventKind.spectrum, spectrum_decoded.audio_kind);
     try testing.expectEqualSlices(u8, &spectrum_bands, &spectrum_decoded.audio_bands);
+
+    const external_encoded = try encodeEffect(.{
+        .kind = .external,
+        .key = 88,
+        .payload = "page-2",
+        .external_request_id = 17,
+        .external_kind = 4001,
+        .external_request_hash = [_]u8{0xa5} ** 32,
+        .external_outcome = .ok,
+    }, &buffer);
+    const external_decoded = try decodeEffect(external_encoded);
+    try testing.expectEqual(runtime_effects.EffectResultKind.external, external_decoded.kind);
+    try testing.expectEqual(@as(u64, 88), external_decoded.key);
+    try testing.expectEqual(@as(u64, 17), external_decoded.external_request_id);
+    try testing.expectEqual(@as(u32, 4001), external_decoded.external_kind);
+    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 32), &external_decoded.external_request_hash);
+    try testing.expectEqual(runtime_effects.EffectExternalOutcome.ok, external_decoded.external_outcome);
+    try testing.expectEqualStrings("page-2", external_decoded.payload);
 }
 
 test "header, checkpoint, screenshot, and end codecs round-trip" {
