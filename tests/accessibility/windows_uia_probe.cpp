@@ -36,6 +36,7 @@ namespace {
 
 constexpr int kDefaultTimeoutMs = 8000;
 constexpr double kDoubleTolerance = 0.0001;
+constexpr double kNoScrollPercent = -1.0;
 
 class Failure : public std::runtime_error {
 public:
@@ -112,6 +113,7 @@ struct Options {
     Selector list = Selector::parse(L"name:Lesson list");
     Selector item = Selector::parse(L"name:Lesson 42");
     Selector above = Selector::parse(L"name:Lesson 40");
+    Selector replacement = Selector::parse(L"name:Lesson 48");
     Selector full_row = Selector::parse(L"name:Lesson 43");
     Selector invoke = Selector::parse(L"name:Count action");
     Selector toggle = Selector::parse(L"name:Study mode");
@@ -173,7 +175,7 @@ void printUsage() {
         << "  discovery hierarchy virtualization patterns bounds focus invoke toggle\n"
         << "  select text value expand events stale\n\n"
         << "Selector syntax is name:TEXT (default) or id:AUTOMATION_ID.\n"
-        << "Selector options: --root --list --item --above --full-row --invoke --toggle\n"
+        << "Selector options: --root --list --item --above --replacement --full-row --invoke --toggle\n"
         << "  --select --text --value --progress --details --expanded-child --grid --grid-row --grid-cell\n"
         << "  --state-cell --transient --remove-transient --restore-transient and each --*-before/--*-after status.\n"
         << "Other options: --timeout-ms N --max-materialized N --expected-position N\n"
@@ -256,6 +258,7 @@ Options parseOptions(int argc, wchar_t **argv) {
         else if (arg == L"--list") options.list = selector(index, "--list");
         else if (arg == L"--item") options.item = selector(index, "--item");
         else if (arg == L"--above") options.above = selector(index, "--above");
+        else if (arg == L"--replacement") options.replacement = selector(index, "--replacement");
         else if (arg == L"--full-row") options.full_row = selector(index, "--full-row");
         else if (arg == L"--invoke") options.invoke = selector(index, "--invoke");
         else if (arg == L"--toggle") options.toggle = selector(index, "--toggle");
@@ -1147,11 +1150,44 @@ void checkHierarchy(const Options &options, const Connection &connection) {
 void checkVirtualization(const Options &options, const Connection &connection) {
     auto list = requireElement(connection.automation.Get(), connection.root.Get(), options.list, options.timeout_ms);
     auto item = requireElement(connection.automation.Get(), list.Get(), options.item, options.timeout_ms);
-    const auto initial_runtime_id = runtimeId(item.Get());
+    auto above = requireElement(connection.automation.Get(), list.Get(), options.above, options.timeout_ms);
+    const auto initial_list_runtime_id = runtimeId(list.Get());
+    const auto initial_item_runtime_id = runtimeId(item.Get());
+    const auto initial_above_runtime_id = runtimeId(above.Get());
+    const auto initial_above_automation_id = currentAutomationId(above.Get());
     require(intProperty(item.Get(), UIA_PositionInSetPropertyId) == options.expected_position,
             "PositionInSet is not " + std::to_string(options.expected_position));
     require(intProperty(item.Get(), UIA_SizeOfSetPropertyId) == options.expected_size,
             "SizeOfSet is not " + std::to_string(options.expected_size));
+
+    auto scroll = requirePattern<IUIAutomationScrollPattern>(
+        list.Get(), UIA_ScrollPatternId, IID_IUIAutomationScrollPattern, "Scroll(Lesson list)"
+    );
+    BOOL horizontally_scrollable = TRUE;
+    BOOL vertically_scrollable = FALSE;
+    double horizontal_percent = 0;
+    double horizontal_view_size = 0;
+    double initial_vertical_percent = 0;
+    double vertical_view_size = 0;
+    requireHr(scroll->get_CurrentHorizontallyScrollable(&horizontally_scrollable), "Scroll.get_CurrentHorizontallyScrollable");
+    requireHr(scroll->get_CurrentVerticallyScrollable(&vertically_scrollable), "Scroll.get_CurrentVerticallyScrollable");
+    requireHr(scroll->get_CurrentHorizontalScrollPercent(&horizontal_percent), "Scroll.get_CurrentHorizontalScrollPercent");
+    requireHr(scroll->get_CurrentHorizontalViewSize(&horizontal_view_size), "Scroll.get_CurrentHorizontalViewSize");
+    requireHr(scroll->get_CurrentVerticalScrollPercent(&initial_vertical_percent), "Scroll.get_CurrentVerticalScrollPercent");
+    requireHr(scroll->get_CurrentVerticalViewSize(&vertical_view_size), "Scroll.get_CurrentVerticalViewSize");
+    const double expected_initial_percent = (1320.0 / (32000.0 - 80.0)) * 100.0;
+    const double expected_view_size = (80.0 / 32000.0) * 100.0;
+    require(horizontally_scrollable == FALSE, "Lesson list incorrectly reports horizontal scrolling");
+    require(vertically_scrollable != FALSE, "Lesson list does not report vertical scrolling");
+    require(approximately(horizontal_percent, kNoScrollPercent),
+            "Lesson list horizontal scroll percent is not UIA_ScrollPatternNoScroll");
+    require(approximately(horizontal_view_size, 100.0), "Lesson list horizontal view size is not 100 percent");
+    require(approximately(initial_vertical_percent, expected_initial_percent, 0.01),
+            "Lesson list initial vertical scroll percent is " + std::to_string(initial_vertical_percent) +
+            ", expected " + std::to_string(expected_initial_percent));
+    require(approximately(vertical_view_size, expected_view_size, 0.01),
+            "Lesson list vertical view size is " + std::to_string(vertical_view_size) +
+            ", expected " + std::to_string(expected_view_size));
 
     VARIANT control_type;
     VariantInit(&control_type);
@@ -1159,25 +1195,93 @@ void checkVirtualization(const Options &options, const Connection &connection) {
     control_type.lVal = UIA_ListItemControlTypeId;
     ComPtr<IUIAutomationCondition> condition;
     requireHr(connection.automation->CreatePropertyCondition(UIA_ControlTypePropertyId, control_type, &condition), "CreatePropertyCondition(ListItem)");
-    ComPtr<IUIAutomationElementArray> items;
-    requireHr(list->FindAll(TreeScope_Descendants, condition.Get(), &items), "FindAll(list items)");
-    int count = 0;
-    requireHr(items->get_Length(&count), "list item array length");
-    require(count <= options.max_materialized,
-            "virtual list materialized " + std::to_string(count) + " rows; cap is " + std::to_string(options.max_materialized));
-    require(count > 0, "virtual list exposed no materialized rows");
+    auto materializedCount = [&]() {
+        ComPtr<IUIAutomationElementArray> items;
+        requireHr(list->FindAll(TreeScope_Descendants, condition.Get(), &items), "FindAll(list items)");
+        int count = 0;
+        requireHr(items->get_Length(&count), "list item array length");
+        return count;
+    };
+    auto requireBoundedMaterialization = [&]() {
+        const int count = materializedCount();
+        require(count <= options.max_materialized,
+                "virtual list materialized " + std::to_string(count) + " rows; cap is " + std::to_string(options.max_materialized));
+        require(count > 0, "virtual list exposed no materialized rows");
+    };
+    requireBoundedMaterialization();
 
     for (int attempt = 0; attempt < 4; ++attempt) {
         auto current = requireElement(connection.automation.Get(), list.Get(), options.item, options.timeout_ms);
-        require(runtimeId(current.Get()) == initial_runtime_id, "Lesson 42 runtime ID changed between queries");
+        require(runtimeId(current.Get()) == initial_item_runtime_id, "Lesson 42 runtime ID changed between queries");
         require(intProperty(current.Get(), UIA_PositionInSetPropertyId) == options.expected_position,
                 "Lesson 42 PositionInSet changed between queries");
         require(intProperty(current.Get(), UIA_SizeOfSetPropertyId) == options.expected_size,
                 "Lesson 42 SizeOfSet changed between queries");
     }
+
+    requireHr(scroll->Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement), "Scroll.Scroll(LargeIncrement)");
+    double scrolled_vertical_percent = initial_vertical_percent;
+    ComPtr<IUIAutomationElement> replacement;
+    const bool scrolled = waitUntil(options.timeout_ms, [&] {
+        try {
+            if (FAILED(scroll->get_CurrentVerticalScrollPercent(&scrolled_vertical_percent)) ||
+                scrolled_vertical_percent <= initial_vertical_percent) return false;
+            if (findElement(connection.automation.Get(), list.Get(), options.above)) return false;
+            replacement = findElement(connection.automation.Get(), list.Get(), options.replacement);
+            auto current_item = findElement(connection.automation.Get(), list.Get(), options.item);
+            return replacement && current_item && runtimeId(current_item.Get()) == initial_item_runtime_id;
+        } catch (...) {
+            return false;
+        }
+    });
+    require(scrolled, "large vertical scroll did not replace Lesson 40 with Lesson 48 while retaining Lesson 42");
+    require(runtimeId(list.Get()) == initial_list_runtime_id, "Lesson list runtime ID changed after scrolling");
+    require(intProperty(replacement.Get(), UIA_PositionInSetPropertyId) == 48,
+            "Lesson 48 PositionInSet is not 48");
+    require(intProperty(replacement.Get(), UIA_SizeOfSetPropertyId) == options.expected_size,
+            "Lesson 48 SizeOfSet changed after scrolling");
+    requireBoundedMaterialization();
+
+    BSTR stale_name = nullptr;
+    HRESULT stale_hr = above->get_CurrentName(&stale_name);
+    SysFreeString(stale_name);
+    require(unavailable(stale_hr),
+            "retained Lesson 40 returned " + hexHr(stale_hr) + " instead of becoming unavailable");
+
+    requireHr(scroll->SetScrollPercent(kNoScrollPercent, initial_vertical_percent),
+              "Scroll.SetScrollPercent(initial)");
+    ComPtr<IUIAutomationElement> restored_above;
+    const bool restored = waitUntil(options.timeout_ms, [&] {
+        try {
+            double vertical_percent = 0;
+            if (FAILED(scroll->get_CurrentVerticalScrollPercent(&vertical_percent)) ||
+                !approximately(vertical_percent, initial_vertical_percent, 0.01)) return false;
+            restored_above = findElement(connection.automation.Get(), list.Get(), options.above);
+            if (!restored_above || findElement(connection.automation.Get(), list.Get(), options.replacement)) return false;
+            auto current_item = findElement(connection.automation.Get(), list.Get(), options.item);
+            return current_item && runtimeId(current_item.Get()) == initial_item_runtime_id;
+        } catch (...) {
+            return false;
+        }
+    });
+    require(restored, "restoring the initial scroll percent did not rematerialize Lesson 40 and remove Lesson 48");
+    require(runtimeId(list.Get()) == initial_list_runtime_id, "Lesson list runtime ID changed after restoring its scroll position");
+    require(currentAutomationId(restored_above.Get()) == initial_above_automation_id,
+            "rematerialized Lesson 40 did not reuse its semantic AutomationId");
+    require(runtimeId(restored_above.Get()) != initial_above_runtime_id,
+            "rematerialized Lesson 40 reused its removed provider RuntimeId");
+    requireBoundedMaterialization();
+
+    stale_name = nullptr;
+    stale_hr = above->get_CurrentName(&stale_name);
+    SysFreeString(stale_name);
+    require(unavailable(stale_hr),
+            "retained Lesson 40 became available again after rematerialization");
 }
 
 void checkPatterns(const Options &options, const Connection &connection) {
+    auto list = requireElement(connection.automation.Get(), connection.root.Get(), options.list, options.timeout_ms);
+    auto item = requireElement(connection.automation.Get(), list.Get(), options.item, options.timeout_ms);
     auto invoke = requireElement(connection.automation.Get(), connection.root.Get(), options.invoke, options.timeout_ms);
     auto toggle = requireElement(connection.automation.Get(), connection.root.Get(), options.toggle, options.timeout_ms);
     auto select = requireElement(connection.automation.Get(), connection.root.Get(), options.select, options.timeout_ms);
@@ -1209,6 +1313,8 @@ void checkPatterns(const Options &options, const Connection &connection) {
     (void)requirePattern<IUIAutomationTextEditPattern>(text.Get(), UIA_TextEditPatternId, IID_IUIAutomationTextEditPattern, "TextEdit");
     (void)requirePattern<IUIAutomationRangeValuePattern>(range.Get(), UIA_RangeValuePatternId, IID_IUIAutomationRangeValuePattern, "RangeValue");
     (void)requirePattern<IUIAutomationExpandCollapsePattern>(details.Get(), UIA_ExpandCollapsePatternId, IID_IUIAutomationExpandCollapsePattern, "ExpandCollapse");
+    (void)requirePattern<IUIAutomationScrollPattern>(list.Get(), UIA_ScrollPatternId, IID_IUIAutomationScrollPattern, "Scroll(Lesson list)");
+    (void)requirePattern<IUIAutomationScrollItemPattern>(item.Get(), UIA_ScrollItemPatternId, IID_IUIAutomationScrollItemPattern, "ScrollItem(Lesson 42)");
     require(!hasPattern(select.Get(), UIA_InvokePatternId, IID_IUIAutomationInvokePattern),
             "Reading mode incorrectly exposes Invoke in addition to SelectionItem");
     require(!hasPattern(details.Get(), UIA_TogglePatternId, IID_IUIAutomationTogglePattern),
