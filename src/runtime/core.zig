@@ -775,6 +775,7 @@ pub const Runtime = struct {
     const focusAutomationCanvasWidget = AutomationWidgetMethods.focusAutomationCanvasWidget;
     const dispatchAutomationWidgetKey = AutomationWidgetMethods.dispatchAutomationWidgetKey;
     const selectAutomationCanvasWidget = AutomationWidgetMethods.selectAutomationCanvasWidget;
+    const setAutomationCanvasWidgetValue = AutomationWidgetMethods.setAutomationCanvasWidgetValue;
     const setAutomationCanvasWidgetText = AutomationWidgetMethods.setAutomationCanvasWidgetText;
     const editAutomationCanvasWidgetText = AutomationWidgetMethods.editAutomationCanvasWidgetText;
     const dispatchAutomationCanvasWidgetDrag = AutomationWidgetMethods.dispatchAutomationCanvasWidgetDrag;
