@@ -1817,6 +1817,11 @@ pub const WidgetAccessibilityActionKind = enum(c_int) {
     drag = 8,
     drop_files = 9,
     dismiss = 10,
+    set_value = 11,
+    /// `WidgetAccessibilityActionEvent.text` carries a signed viewport fraction.
+    scroll_by = 12,
+    /// `WidgetAccessibilityActionEvent.text` carries a normalized target in `[0, 1]`.
+    scroll_to = 13,
 };
 
 pub const WidgetAccessibilityActionEvent = struct {
