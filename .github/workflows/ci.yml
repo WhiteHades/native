@@ -36,6 +36,7 @@ jobs:
         with:
           version: 0.16.0
       - run: zig build test-webview-system-link
+      - run: zig build test-macos-web-layer-audit
       - run: zig build test-webview-smoke
       # Signed-package seal pin: an ad-hoc signed package must pass
       # codesign --verify --strict (macOS runners are the only tier with
