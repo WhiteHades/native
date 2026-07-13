@@ -1608,9 +1608,17 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\        switch (web_engine) {
         \\            .system => {
         \\                const sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
-        \\                const flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0" };
+        \\                const flags: []const []const u8 = if (b.sysroot) |sysroot|
+        \\                    if (web_layer)
+        \\                        &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include }
+        \\                    else
+        \\                        &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-DNATIVE_SDK_ALLOW_WEBKIT_STUB=1", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include }
+        \\                else if (web_layer)
+        \\                    &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0" }
+        \\                else
+        \\                    &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-DNATIVE_SDK_ALLOW_WEBKIT_STUB=1", "-mmacosx-version-min=11.0" };
         \\                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/macos/appkit_host.m"), .flags = flags });
-        \\                app_mod.linkFramework("WebKit", .{});
+        \\                if (web_layer) app_mod.linkFramework("WebKit", .{});
         \\            },
         \\            .chromium => {
         \\                const cef_check = addCefCheck(b, target, cef_dir);
@@ -2411,7 +2419,7 @@ fn runnerZig() []const u8 {
     \\    const runtime = try std.heap.page_allocator.create(native_sdk.Runtime);
     \\    defer std.heap.page_allocator.destroy(runtime);
     \\    native_sdk.Runtime.initAt(runtime, .{
-    \\        .platform = mac_platform.platform(),
+    \\        .platform = if (comptime webLayerEnabled()) mac_platform.platform() else mac_platform.nativePlatform(),
     \\        .trace_sink = runtime_trace_sink,
     \\        .log_path = if (log_setup) |setup| setup.paths.log_file else null,
     \\        .bridge = options.bridge,
