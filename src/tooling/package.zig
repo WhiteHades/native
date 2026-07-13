@@ -209,6 +209,20 @@ pub fn createMacosApp(allocator: std.mem.Allocator, io: std.Io, options: Package
     try package_dir.createDirPath(io, "Contents/Resources");
 
     const executable_name = std.fs.path.basename(options.metadata.name);
+    // A native-only macOS package must contain the binary built through
+    // the AppKit WebKit compile seam. Refuse a hand-supplied or stale
+    // executable that still links WebKit.framework instead of producing
+    // a package whose report claims the layer is absent while dyld still
+    // loads it.
+    if (options.web_engine == .system and !webLayerFor(options).enabled) {
+        if (options.binary_path) |binary_path| {
+            if (try machoReferencesWebKit(allocator, io, binary_path)) {
+                std.debug.print("error: {s} links WebKit.framework but this package ships no web layer - the binary was built with the embedded web layer (for example `zig build -Dweb-layer=include`)\n" ++
+                    "  package with `--web-layer include`, or rebuild the binary to match the packaging decision\n", .{binary_path});
+                return error.WebViewLayerMismatch;
+            }
+        }
+    }
     if (options.binary_path) |binary_path| {
         const executable_subpath = try std.fmt.allocPrint(allocator, "Contents/MacOS/{s}", .{executable_name});
         defer allocator.free(executable_subpath);
@@ -1069,6 +1083,56 @@ fn peReferencesWebView2Loader(allocator: std.mem.Allocator, io: std.Io, path: []
     }
     return std.mem.indexOf(u8, bytes, &needle_wide) != null or
         std.mem.indexOf(u8, bytes, needle_ascii) != null;
+}
+
+/// Whether a macOS executable carries the system WebKit layer. Native
+/// SDK emits one 64-bit little-endian Mach-O per target architecture;
+/// WebKit.framework must appear in an LC_LOAD_DYLIB-family command when
+/// linked. A non-Mach-O or malformed file proves nothing and scans false,
+/// matching the PE/ELF package-time probes.
+fn machoReferencesWebKit(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
+    const bytes = try readPath(allocator, io, path);
+    defer allocator.free(bytes);
+    return machoBytesReferenceWebKit(bytes);
+}
+
+fn machoBytesReferenceWebKit(bytes: []const u8) bool {
+    if (bytes.len < 32 or !std.mem.eql(u8, bytes[0..4], "\xcf\xfa\xed\xfe")) return false;
+    const command_count = std.mem.readInt(u32, bytes[16..20], .little);
+    const command_bytes: usize = std.mem.readInt(u32, bytes[20..24], .little);
+    if (command_bytes > bytes.len - 32) return false;
+    const commands = bytes[32..][0..command_bytes];
+
+    var cursor: usize = 0;
+    var index: u32 = 0;
+    while (index < command_count) : (index += 1) {
+        if (cursor + 8 > commands.len) return false;
+        const command = std.mem.readInt(u32, commands[cursor..][0..4], .little);
+        const command_size: usize = std.mem.readInt(u32, commands[cursor + 4 ..][0..4], .little);
+        if (command_size < 8 or command_size > commands.len - cursor) return false;
+        const load_command = commands[cursor..][0..command_size];
+        if (isMachODylibLoadCommand(command)) {
+            if (load_command.len < 24) return false;
+            const name_offset: usize = std.mem.readInt(u32, load_command[8..12], .little);
+            if (name_offset >= load_command.len) return false;
+            const name_end = std.mem.indexOfScalarPos(u8, load_command, name_offset, 0) orelse load_command.len;
+            if (std.mem.indexOf(u8, load_command[name_offset..name_end], "WebKit.framework") != null) return true;
+        }
+        cursor += command_size;
+    }
+    return false;
+}
+
+fn isMachODylibLoadCommand(command: u32) bool {
+    return switch (command) {
+        0x0c,
+        0x18 | 0x8000_0000,
+        0x1f | 0x8000_0000,
+        0x20,
+        0x23 | 0x8000_0000,
+        => true,
+        else => false,
+    };
 }
 
 /// Whether a Linux executable carries the embedded web layer: the GTK
@@ -2771,6 +2835,58 @@ fn testWebLayerElfBytes(gpa: std.mem.Allocator, needed_lib: []const u8, symbol_n
     shdr.write(bytes, shdr_offset, 1, 6, 0, dynamic_offset, 32, 16);
     shdr.write(bytes, shdr_offset, 2, 11, 0, dynsym_offset, 48, 24);
     return bytes;
+}
+
+fn testWebLayerMachOBytes(gpa: std.mem.Allocator, dylib_path: []const u8) ![]u8 {
+    const command_size = std.mem.alignForward(usize, 24 + dylib_path.len + 1, 8);
+    const bytes = try gpa.alloc(u8, 32 + command_size);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..4], "\xcf\xfa\xed\xfe");
+    std.mem.writeInt(u32, bytes[16..20], 1, .little);
+    std.mem.writeInt(u32, bytes[20..24], @intCast(command_size), .little);
+    std.mem.writeInt(u32, bytes[32..36], 0x0c, .little); // LC_LOAD_DYLIB
+    std.mem.writeInt(u32, bytes[36..40], @intCast(command_size), .little);
+    std.mem.writeInt(u32, bytes[40..44], 24, .little);
+    @memcpy(bytes[56..][0..dylib_path.len], dylib_path);
+    return bytes;
+}
+
+test "the macOS web-layer scan reads framework load commands" {
+    const gpa = std.testing.allocator;
+    const linked = try testWebLayerMachOBytes(gpa, "/System/Library/Frameworks/WebKit.framework/Versions/A/WebKit");
+    defer gpa.free(linked);
+    try std.testing.expect(machoBytesReferenceWebKit(linked));
+
+    const clean = try testWebLayerMachOBytes(gpa, "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit");
+    defer gpa.free(clean);
+    try std.testing.expect(!machoBytesReferenceWebKit(clean));
+    try std.testing.expect(!machoBytesReferenceWebKit("not an executable"));
+}
+
+test "package refuses a native-only macOS binary that links WebKit" {
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-web-layer-macos-mismatch";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    const macho_bytes = try testWebLayerMachOBytes(std.testing.allocator, "/System/Library/Frameworks/WebKit.framework/Versions/A/WebKit");
+    defer std.testing.allocator.free(macho_bytes);
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/app", .data = macho_bytes });
+
+    const capabilities = [_][]const u8{ "native_views", "gpu_surfaces" };
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.macos-mismatch",
+        .name = "macos-mismatch-demo",
+        .version = "1.0.0",
+        .capabilities = &capabilities,
+    };
+    try std.testing.expectError(error.WebViewLayerMismatch, createPackage(std.testing.allocator, std.testing.io, .{
+        .metadata = metadata,
+        .target = .macos,
+        .output_path = root ++ "/demo.app",
+        .binary_path = root ++ "/app",
+        .assets_dir = root ++ "/assets",
+    }));
 }
 
 test "the linux web-layer scan reads DT_NEEDED and dynamic symbols" {
