@@ -1,0 +1,24 @@
+.{
+    .id = "dev.native_sdk.accessibility_smoke",
+    .name = "accessibility-smoke",
+    .display_name = "Accessibility Smoke",
+    .description = "A deterministic native accessibility bridge fixture.",
+    .version = "0.1.0",
+    .host = "native",
+    .platforms = .{ "macos", "linux", "windows" },
+    .capabilities = .{ "native_views", "gpu_surfaces" },
+    .shell = .{
+        .windows = .{
+            .{
+                .label = "main",
+                .title = "Accessibility Smoke",
+                .width = 720,
+                .height = 760,
+                .restore_state = false,
+                .views = .{
+                    .{ .label = "accessibility-canvas", .kind = "gpu_surface", .fill = true, .role = "Accessibility fixture canvas", .accessibility_label = "Accessibility Smoke", .gpu_backend = "software", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
+                },
+            },
+        },
+    },
+}
