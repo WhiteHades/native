@@ -677,9 +677,17 @@ fn linkPlatform(b: *std.Build, dep: *std.Build.Dependency, target: std.Build.Res
         switch (web_engine) {
             .system => {
                 const sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
-                const flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0" };
+                const flags: []const []const u8 = if (b.sysroot) |sysroot|
+                    if (web_layer)
+                        &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include }
+                    else
+                        &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-DNATIVE_SDK_ALLOW_WEBKIT_STUB=1", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include }
+                else if (web_layer)
+                    &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0" }
+                else
+                    &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-DNATIVE_SDK_ALLOW_WEBKIT_STUB=1", "-mmacosx-version-min=11.0" };
                 app_mod.addCSourceFile(.{ .file = dep.path("src/platform/macos/appkit_host.m"), .flags = flags });
-                app_mod.linkFramework("WebKit", .{});
+                if (web_layer) app_mod.linkFramework("WebKit", .{});
             },
             .chromium => {
                 const cef_check = addCefCheck(b, target, cef_dir);
