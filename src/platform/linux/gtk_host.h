@@ -29,7 +29,96 @@ typedef enum {
     NATIVE_SDK_GTK_EVENT_TIMER = 15,
     NATIVE_SDK_GTK_EVENT_APPEARANCE = 16,
     NATIVE_SDK_GTK_EVENT_AUDIO = 17,
+    NATIVE_SDK_GTK_EVENT_WIDGET_ACCESSIBILITY_ACTION = 18,
 } native_sdk_gtk_event_kind_t;
+
+typedef enum {
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_FOCUS = 0,
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_PRESS = 1,
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_TOGGLE = 2,
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_INCREMENT = 3,
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_DECREMENT = 4,
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_SET_TEXT = 5,
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_SET_SELECTION = 6,
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_SELECT = 7,
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_DRAG = 8,
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_DROP_FILES = 9,
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_DISMISS = 10,
+    NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_SET_VALUE = 11,
+} native_sdk_gtk_widget_accessibility_action_t;
+
+enum {
+    NATIVE_SDK_GTK_WIDGET_STATE_ENABLED = 1u << 0,
+    NATIVE_SDK_GTK_WIDGET_STATE_FOCUSED = 1u << 1,
+    NATIVE_SDK_GTK_WIDGET_STATE_SELECTED = 1u << 2,
+    NATIVE_SDK_GTK_WIDGET_STATE_PRESSED = 1u << 3,
+    NATIVE_SDK_GTK_WIDGET_STATE_EXPANDED = 1u << 4,
+    NATIVE_SDK_GTK_WIDGET_STATE_COLLAPSED = 1u << 5,
+    NATIVE_SDK_GTK_WIDGET_STATE_REQUIRED = 1u << 6,
+    NATIVE_SDK_GTK_WIDGET_STATE_READ_ONLY = 1u << 7,
+    NATIVE_SDK_GTK_WIDGET_STATE_INVALID = 1u << 8,
+    NATIVE_SDK_GTK_WIDGET_STATE_HOVERED = 1u << 9,
+};
+
+enum {
+    NATIVE_SDK_GTK_WIDGET_ACTION_FOCUS = 1u << 0,
+    NATIVE_SDK_GTK_WIDGET_ACTION_PRESS = 1u << 1,
+    NATIVE_SDK_GTK_WIDGET_ACTION_TOGGLE = 1u << 2,
+    NATIVE_SDK_GTK_WIDGET_ACTION_INCREMENT = 1u << 3,
+    NATIVE_SDK_GTK_WIDGET_ACTION_DECREMENT = 1u << 4,
+    NATIVE_SDK_GTK_WIDGET_ACTION_SET_TEXT = 1u << 5,
+    NATIVE_SDK_GTK_WIDGET_ACTION_SET_SELECTION = 1u << 6,
+    NATIVE_SDK_GTK_WIDGET_ACTION_SELECT = 1u << 7,
+    NATIVE_SDK_GTK_WIDGET_ACTION_DRAG = 1u << 8,
+    NATIVE_SDK_GTK_WIDGET_ACTION_DROP_FILES = 1u << 9,
+    NATIVE_SDK_GTK_WIDGET_ACTION_DISMISS = 1u << 10,
+};
+
+typedef struct {
+    uint64_t id;
+    int has_parent_id;
+    uint64_t parent_id;
+    int role;
+    const char *label;
+    size_t label_len;
+    const char *text_value;
+    size_t text_value_len;
+    const char *placeholder;
+    size_t placeholder_len;
+    int has_text_selection;
+    size_t text_selection_start;
+    size_t text_selection_end;
+    int has_text_composition;
+    size_t text_composition_start;
+    size_t text_composition_end;
+    int has_value;
+    double value;
+    int has_grid_row_index;
+    size_t grid_row_index;
+    int has_grid_column_index;
+    size_t grid_column_index;
+    int has_grid_row_count;
+    size_t grid_row_count;
+    int has_grid_column_count;
+    size_t grid_column_count;
+    int has_list_item_index;
+    uint32_t list_item_index;
+    int has_list_item_count;
+    uint32_t list_item_count;
+    int has_scroll_offset;
+    double scroll_offset;
+    int has_scroll_viewport_extent;
+    double scroll_viewport_extent;
+    int has_scroll_content_extent;
+    double scroll_content_extent;
+    double x;
+    double y;
+    double width;
+    double height;
+    uint32_t state_flags;
+    uint32_t action_flags;
+    int focusable;
+} native_sdk_gtk_widget_accessibility_node_t;
 
 typedef struct {
     native_sdk_gtk_event_kind_t kind;
@@ -89,6 +178,13 @@ typedef struct {
      * 50 Hz..16 kHz buckets, each linear-in-dB from -60 dBFS at 0 to
      * full scale at 255. All zeros on every other event kind. */
     uint8_t audio_bands[32];
+    uint64_t widget_id;
+    int widget_action;
+    const char *widget_text;
+    size_t widget_text_len;
+    int has_widget_text_selection;
+    size_t widget_text_selection_start;
+    size_t widget_text_selection_end;
 } native_sdk_gtk_event_t;
 
 typedef void (*native_sdk_gtk_event_callback_t)(void *context, const native_sdk_gtk_event_t *event);
@@ -212,6 +308,7 @@ int native_sdk_gtk_focus_view(native_sdk_gtk_host_t *host, uint64_t window_id, c
 int native_sdk_gtk_close_view(native_sdk_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len);
 int native_sdk_gtk_request_gpu_surface_frame(native_sdk_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len);
 int native_sdk_gtk_present_gpu_surface_pixels(native_sdk_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, size_t width, size_t height, double scale, int has_dirty_rect, double dirty_x, double dirty_y, double dirty_width, double dirty_height, const uint8_t *rgba8, size_t rgba8_len);
+int native_sdk_gtk_update_widget_accessibility(native_sdk_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, const native_sdk_gtk_widget_accessibility_node_t *nodes, size_t node_count);
 int native_sdk_gtk_create_webview(native_sdk_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len, double x, double y, double width, double height, int layer, int transparent, int bridge_enabled);
 int native_sdk_gtk_set_webview_frame(native_sdk_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height);
 int native_sdk_gtk_navigate_webview(native_sdk_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len);
