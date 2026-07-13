@@ -32,6 +32,7 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
 pub const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 pub const Msg = union(enum) {
+    lesson_scrolled: canvas.ScrollState,
     count,
     toggle_study,
     select_reading,
@@ -44,6 +45,7 @@ pub const Msg = union(enum) {
 };
 
 pub const Model = struct {
+    lesson_scroll_offset: f32 = initial_scroll_offset,
     count: u32 = 0,
     study_mode: bool = false,
     reading_mode: bool = false,
@@ -65,6 +67,7 @@ pub const Model = struct {
 
 pub fn update(model: *Model, msg: Msg) void {
     switch (msg) {
+        .lesson_scrolled => |scroll| model.lesson_scroll_offset = scroll.offset,
         .count => model.count += 1,
         .toggle_study => model.study_mode = !model.study_mode,
         .select_reading => model.reading_mode = true,
@@ -90,8 +93,18 @@ pub fn lessonWindow(scroll_offset: f32) canvas.VirtualListRange {
     });
 }
 
-fn lessonList(ui: *SmokeUi, scroll_offset: f32) SmokeUi.Node {
-    const window = lessonWindow(scroll_offset);
+fn lessonList(ui: *SmokeUi, model: *const Model) SmokeUi.Node {
+    const list_options = SmokeUi.VirtualListOptions{
+        .id = "lesson-list",
+        .item_count = lesson_count,
+        .item_extent = lesson_row_extent,
+        .overscan = lesson_overscan,
+        .viewport_fallback = lesson_viewport_height,
+        .height = lesson_viewport_height,
+        .on_scroll = SmokeUi.scrollMsg(.lesson_scrolled),
+        .semantics = .{ .label = "Lesson list" },
+    };
+    const window = lessonWindow(model.lesson_scroll_offset);
     const rows = ui.arena.alloc(SmokeUi.Node, window.itemCount()) catch {
         ui.failed = true;
         return ui.list(.{}, .{});
@@ -106,17 +119,7 @@ fn lessonList(ui: *SmokeUi, scroll_offset: f32) SmokeUi.Node {
         node.key = .{ .int = @intCast(index) };
         row.* = node;
     }
-    return ui.el(.list, .{
-        .global_key = .{ .str = "lesson-list" },
-        .value = window.layout_offset,
-        .height = lesson_viewport_height,
-        .virtualized = true,
-        .virtual_item_extent = lesson_row_extent,
-        .virtual_overscan = lesson_overscan,
-        .virtual_item_count = lesson_count,
-        .virtual_first_index = window.start_index,
-        .semantics = .{ .label = "Lesson list" },
-    }, .{rows});
+    return ui.virtualList(list_options, window, .{rows});
 }
 
 fn resultText(ui: *SmokeUi, label: []const u8) SmokeUi.Node {
@@ -177,7 +180,7 @@ pub fn view(ui: *SmokeUi, model: *const Model) SmokeUi.Node {
     const transient_result = ui.fmt("Transient result: {s}", .{if (model.transient_present) "present" else "removed"});
 
     return ui.column(.{ .padding = 12, .gap = 8, .semantics = .{ .label = "Accessibility smoke" } }, .{
-        lessonList(ui, initial_scroll_offset),
+        lessonList(ui, model),
         ui.column(.{ .gap = 6, .semantics = .{ .label = "Controls" } }, .{
             ui.row(.{ .gap = 8, .cross = .center }, .{
                 ui.button(.{ .on_press = .count, .semantics = .{ .label = "Count action" } }, "Count action"),
