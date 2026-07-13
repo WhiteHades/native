@@ -484,7 +484,7 @@ fn runMacos(app: native_sdk.App, options: RunOptions, init: std.process.Init) !v
     const runtime = try std.heap.page_allocator.create(native_sdk.Runtime);
     defer std.heap.page_allocator.destroy(runtime);
     native_sdk.Runtime.initAt(runtime, .{
-        .platform = mac_platform.platform(),
+        .platform = if (comptime webLayerEnabled()) mac_platform.platform() else mac_platform.nativePlatform(),
         .trace_sink = runtime_trace_sink,
         .log_path = if (log_setup) |setup| setup.paths.log_file else null,
         .bridge = options.bridge,
