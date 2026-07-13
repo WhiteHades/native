@@ -655,9 +655,36 @@ Connection connect(const Options &options) {
     return connection;
 }
 
+std::vector<int> eventRuntimeId(IUIAutomationElement *element) {
+    std::vector<int> result;
+    if (!element) return result;
+    SAFEARRAY *array = nullptr;
+    if (FAILED(element->GetRuntimeId(&array)) || !array) return result;
+    struct ArrayGuard {
+        SAFEARRAY *value;
+        ~ArrayGuard() { SafeArrayDestroy(value); }
+    } guard = { array };
+    if (SafeArrayGetDim(array) != 1) return result;
+    LONG lower = 0;
+    LONG upper = -1;
+    if (FAILED(SafeArrayGetLBound(array, 1, &lower)) ||
+        FAILED(SafeArrayGetUBound(array, 1, &upper)) || upper < lower) return result;
+    result.reserve(static_cast<size_t>(upper - lower + 1));
+    for (LONG index = lower; index <= upper; ++index) {
+        int value = 0;
+        if (FAILED(SafeArrayGetElement(array, &index, &value))) return {};
+        result.push_back(value);
+    }
+    return result;
+}
+
 class AutomationEventRecorder final : public IUIAutomationEventHandler,
                                       public IUIAutomationFocusChangedEventHandler {
 public:
+    struct Record {
+        EVENTID event_id;
+        std::vector<int> sender_runtime_id;
+    };
     void setFocusTarget(IUIAutomation *automation, IUIAutomationElement *target) {
         automation_ = automation;
         focus_target_ = target;
@@ -677,9 +704,17 @@ public:
         if (remaining == 0) delete this;
         return remaining;
     }
-    HRESULT STDMETHODCALLTYPE HandleAutomationEvent(IUIAutomationElement *, EVENTID event_id) override {
-        std::lock_guard<std::mutex> guard(mutex_);
-        counts_[event_id] += 1;
+    HRESULT STDMETHODCALLTYPE HandleAutomationEvent(IUIAutomationElement *sender, EVENTID event_id) override {
+        try {
+            Record record = { event_id, eventRuntimeId(sender) };
+            std::lock_guard<std::mutex> guard(mutex_);
+            counts_[event_id] += 1;
+            if (record.sender_runtime_id.empty()) invalid_records_ += 1;
+            records_.push_back(std::move(record));
+        } catch (...) {
+            std::lock_guard<std::mutex> guard(mutex_);
+            invalid_records_ += 1;
+        }
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE HandleFocusChangedEvent(IUIAutomationElement *sender) override {
@@ -695,16 +730,47 @@ public:
         const auto found = counts_.find(event_id);
         return found == counts_.end() ? 0 : found->second;
     }
+    size_t size() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return records_.size();
+    }
+    int countExact(EVENTID event_id, const std::vector<int> &sender_runtime_id, size_t start = 0) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        int result = 0;
+        for (size_t index = std::min(start, records_.size()); index < records_.size(); ++index) {
+            if (records_[index].event_id == event_id && records_[index].sender_runtime_id == sender_runtime_id) result += 1;
+        }
+        return result;
+    }
+    int invalidRecords() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return invalid_records_;
+    }
 private:
     std::atomic<ULONG> references_{1};
     mutable std::mutex mutex_;
     std::map<EVENTID, int> counts_;
+    std::vector<Record> records_;
+    int invalid_records_ = 0;
     ComPtr<IUIAutomation> automation_;
     ComPtr<IUIAutomationElement> focus_target_;
 };
 
 class PropertyEventRecorder final : public IUIAutomationPropertyChangedEventHandler {
 public:
+    struct Value {
+        VARTYPE type = VT_EMPTY;
+        bool valid = false;
+        int integer = 0;
+        bool boolean = false;
+        double number = 0;
+        std::vector<double> numbers;
+    };
+    struct Record {
+        PROPERTYID property_id;
+        std::vector<int> sender_runtime_id;
+        Value value;
+    };
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
         if (!object) return E_INVALIDARG;
         *object = nullptr;
@@ -719,9 +785,17 @@ public:
         if (remaining == 0) delete this;
         return remaining;
     }
-    HRESULT STDMETHODCALLTYPE HandlePropertyChangedEvent(IUIAutomationElement *, PROPERTYID property_id, VARIANT) override {
-        std::lock_guard<std::mutex> guard(mutex_);
-        counts_[property_id] += 1;
+    HRESULT STDMETHODCALLTYPE HandlePropertyChangedEvent(IUIAutomationElement *sender, PROPERTYID property_id, VARIANT new_value) override {
+        try {
+            Record record = { property_id, eventRuntimeId(sender), copyValue(new_value) };
+            std::lock_guard<std::mutex> guard(mutex_);
+            counts_[property_id] += 1;
+            if (!record.value.valid || record.sender_runtime_id.empty()) invalid_records_ += 1;
+            records_.push_back(std::move(record));
+        } catch (...) {
+            std::lock_guard<std::mutex> guard(mutex_);
+            invalid_records_ += 1;
+        }
         return S_OK;
     }
     int count(PROPERTYID property_id) const {
@@ -729,10 +803,117 @@ public:
         const auto found = counts_.find(property_id);
         return found == counts_.end() ? 0 : found->second;
     }
+    size_t size() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return records_.size();
+    }
+    int countExact(PROPERTYID property_id, const std::vector<int> &sender_runtime_id, size_t start = 0) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        int result = 0;
+        for (size_t index = std::min(start, records_.size()); index < records_.size(); ++index) {
+            if (records_[index].property_id == property_id && records_[index].sender_runtime_id == sender_runtime_id) result += 1;
+        }
+        return result;
+    }
+    bool hasDouble(
+        PROPERTYID property_id,
+        const std::vector<int> &sender_runtime_id,
+        double expected,
+        size_t start = 0,
+        double tolerance = kDoubleTolerance
+    ) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        for (size_t index = std::min(start, records_.size()); index < records_.size(); ++index) {
+            const Record &record = records_[index];
+            if (record.property_id == property_id && record.sender_runtime_id == sender_runtime_id &&
+                record.value.valid && record.value.type == VT_R8 && approximately(record.value.number, expected, tolerance)) return true;
+        }
+        return false;
+    }
+    bool hasBool(
+        PROPERTYID property_id,
+        const std::vector<int> &sender_runtime_id,
+        bool expected,
+        size_t start = 0
+    ) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        for (size_t index = std::min(start, records_.size()); index < records_.size(); ++index) {
+            const Record &record = records_[index];
+            if (record.property_id == property_id && record.sender_runtime_id == sender_runtime_id &&
+                record.value.valid && record.value.type == VT_BOOL && record.value.boolean == expected) return true;
+        }
+        return false;
+    }
+    bool hasRect(
+        PROPERTYID property_id,
+        const std::vector<int> &sender_runtime_id,
+        const RECT &expected,
+        size_t start = 0
+    ) const {
+        const double coordinates[] = {
+            static_cast<double>(expected.left),
+            static_cast<double>(expected.top),
+            static_cast<double>(expected.right - expected.left),
+            static_cast<double>(expected.bottom - expected.top),
+        };
+        std::lock_guard<std::mutex> guard(mutex_);
+        for (size_t index = std::min(start, records_.size()); index < records_.size(); ++index) {
+            const Record &record = records_[index];
+            if (record.property_id != property_id || record.sender_runtime_id != sender_runtime_id ||
+                !record.value.valid || record.value.type != (VT_ARRAY | VT_R8) || record.value.numbers.size() != 4) continue;
+            bool matches = true;
+            for (size_t coordinate = 0; coordinate < 4; ++coordinate) {
+                if (!approximately(record.value.numbers[coordinate], coordinates[coordinate])) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) return true;
+        }
+        return false;
+    }
+    int invalidRecords() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return invalid_records_;
+    }
 private:
+    static Value copyValue(const VARIANT &source) {
+        Value result;
+        result.type = source.vt;
+        if (source.vt == VT_I4 || source.vt == VT_INT) {
+            result.integer = source.lVal;
+            result.valid = true;
+        } else if (source.vt == VT_BOOL) {
+            result.boolean = source.boolVal != VARIANT_FALSE;
+            result.valid = true;
+        } else if (source.vt == VT_R8) {
+            result.number = source.dblVal;
+            result.valid = true;
+        } else if (source.vt == (VT_ARRAY | VT_R8) && source.parray && SafeArrayGetDim(source.parray) == 1) {
+            LONG lower = 0;
+            LONG upper = -1;
+            if (SUCCEEDED(SafeArrayGetLBound(source.parray, 1, &lower)) &&
+                SUCCEEDED(SafeArrayGetUBound(source.parray, 1, &upper)) && upper >= lower) {
+                result.numbers.reserve(static_cast<size_t>(upper - lower + 1));
+                result.valid = true;
+                for (LONG index = lower; index <= upper; ++index) {
+                    double value = 0;
+                    if (FAILED(SafeArrayGetElement(source.parray, &index, &value))) {
+                        result.valid = false;
+                        result.numbers.clear();
+                        break;
+                    }
+                    result.numbers.push_back(value);
+                }
+            }
+        }
+        return result;
+    }
     std::atomic<ULONG> references_{1};
     mutable std::mutex mutex_;
     std::map<PROPERTYID, int> counts_;
+    std::vector<Record> records_;
+    int invalid_records_ = 0;
 };
 
 class TextEditEventRecorder final : public IUIAutomationTextEditTextChangedEventHandler {
@@ -855,6 +1036,15 @@ public:
         std::lock_guard<std::mutex> guard(mutex_);
         return invalid_removed_runtime_ids_;
     }
+    size_t size() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return records_.size();
+    }
+    std::vector<Record> recordsSince(size_t start) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        const auto first = records_.begin() + static_cast<std::ptrdiff_t>(std::min(start, records_.size()));
+        return std::vector<Record>(first, records_.end());
+    }
     bool hasExactChange(
         StructureChangeType type,
         const std::vector<int> &sender_runtime_id,
@@ -922,6 +1112,119 @@ private:
     ComPtr<IUIAutomationElement> root_;
     ComPtr<StructureEventRecorder> events_;
     bool registered_ = false;
+};
+
+class VirtualizationEventSession {
+public:
+    ~VirtualizationEventSession() { stop(); }
+
+    void start(IUIAutomation *automation, IUIAutomationElement *list, IUIAutomationElement *item) {
+        automation_ = automation;
+        automation_->AddRef();
+        list_ = list;
+        item_ = item;
+        automation_events_.Attach(new AutomationEventRecorder());
+        property_events_.Attach(new PropertyEventRecorder());
+        structure_events_.Attach(new StructureEventRecorder());
+        try {
+            requireHr(automation_->AddAutomationEventHandler(
+                UIA_LayoutInvalidatedEventId,
+                list_.Get(),
+                TreeScope_Element,
+                nullptr,
+                automation_events_.Get()
+            ), "AddAutomationEventHandler(LayoutInvalidated Lesson list)");
+            layout_registered_ = true;
+            addProperties(list_.Get(), { UIA_ScrollVerticalScrollPercentPropertyId });
+            list_properties_registered_ = true;
+            addProperties(item_.Get(), {
+                UIA_BoundingRectanglePropertyId,
+                UIA_IsOffscreenPropertyId,
+                UIA_PositionInSetPropertyId,
+                UIA_SizeOfSetPropertyId,
+            });
+            item_properties_registered_ = true;
+            requireHr(automation_->AddStructureChangedEventHandler(
+                list_.Get(),
+                TreeScope_Subtree,
+                nullptr,
+                structure_events_.Get()
+            ), "AddStructureChangedEventHandler(Lesson list)");
+            structure_registered_ = true;
+        } catch (...) {
+            stop();
+            throw;
+        }
+    }
+
+    void stop() {
+        if (!automation_) return;
+        if (layout_registered_) {
+            automation_->RemoveAutomationEventHandler(
+                UIA_LayoutInvalidatedEventId,
+                list_.Get(),
+                automation_events_.Get()
+            );
+        }
+        if (list_properties_registered_) {
+            automation_->RemovePropertyChangedEventHandler(list_.Get(), property_events_.Get());
+        }
+        if (item_properties_registered_) {
+            automation_->RemovePropertyChangedEventHandler(item_.Get(), property_events_.Get());
+        }
+        if (structure_registered_) {
+            automation_->RemoveStructureChangedEventHandler(list_.Get(), structure_events_.Get());
+        }
+        layout_registered_ = false;
+        list_properties_registered_ = false;
+        item_properties_registered_ = false;
+        structure_registered_ = false;
+        list_.Reset();
+        item_.Reset();
+        automation_events_.Reset();
+        property_events_.Reset();
+        structure_events_.Reset();
+        automation_->Release();
+        automation_ = nullptr;
+    }
+
+    AutomationEventRecorder *automationEvents() const { return automation_events_.Get(); }
+    PropertyEventRecorder *propertyEvents() const { return property_events_.Get(); }
+    StructureEventRecorder *structureEvents() const { return structure_events_.Get(); }
+
+private:
+    void addProperties(IUIAutomationElement *element, const std::vector<PROPERTYID> &properties) {
+        SAFEARRAY *array = SafeArrayCreateVector(VT_I4, 0, static_cast<ULONG>(properties.size()));
+        require(array != nullptr, "could not allocate virtualization property event array");
+        for (LONG index = 0; index < static_cast<LONG>(properties.size()); ++index) {
+            LONG property = properties[static_cast<size_t>(index)];
+            const HRESULT hr = SafeArrayPutElement(array, &index, &property);
+            if (FAILED(hr)) {
+                SafeArrayDestroy(array);
+                requireHr(hr, "SafeArrayPutElement(virtualization property event)");
+            }
+        }
+        const HRESULT hr = automation_->AddPropertyChangedEventHandler(
+            element,
+            TreeScope_Element,
+            nullptr,
+            property_events_.Get(),
+            array
+        );
+        SafeArrayDestroy(array);
+        requireHr(hr, "AddPropertyChangedEventHandler(virtualization)");
+    }
+
+    IUIAutomation *automation_ = nullptr;
+    ComPtr<IUIAutomationElement> list_;
+    ComPtr<IUIAutomationElement> item_;
+    ComPtr<AutomationEventRecorder> automation_events_;
+    ComPtr<PropertyEventRecorder> property_events_;
+    ComPtr<StructureEventRecorder> structure_events_;
+    bool layout_registered_ = false;
+    bool list_properties_registered_ = false;
+    bool item_properties_registered_ = false;
+    bool structure_registered_ = false;
 };
 
 class PreciseEventSession {
@@ -1155,6 +1458,8 @@ void checkVirtualization(const Options &options, const Connection &connection) {
     const auto initial_item_runtime_id = runtimeId(item.Get());
     const auto initial_above_runtime_id = runtimeId(above.Get());
     const auto initial_above_automation_id = currentAutomationId(above.Get());
+    const RECT initial_item_rect = currentRect(item.Get());
+    require(!currentOffscreen(item.Get()), "Lesson 42 is initially offscreen");
     require(intProperty(item.Get(), UIA_PositionInSetPropertyId) == options.expected_position,
             "PositionInSet is not " + std::to_string(options.expected_position));
     require(intProperty(item.Get(), UIA_SizeOfSetPropertyId) == options.expected_size,
@@ -1176,6 +1481,7 @@ void checkVirtualization(const Options &options, const Connection &connection) {
     requireHr(scroll->get_CurrentVerticalScrollPercent(&initial_vertical_percent), "Scroll.get_CurrentVerticalScrollPercent");
     requireHr(scroll->get_CurrentVerticalViewSize(&vertical_view_size), "Scroll.get_CurrentVerticalViewSize");
     const double expected_initial_percent = (1320.0 / (32000.0 - 80.0)) * 100.0;
+    const double expected_scrolled_percent = ((1320.0 + 80.0 * 0.85) / (32000.0 - 80.0)) * 100.0;
     const double expected_view_size = (80.0 / 32000.0) * 100.0;
     require(horizontally_scrollable == FALSE, "Lesson list incorrectly reports horizontal scrolling");
     require(vertically_scrollable != FALSE, "Lesson list does not report vertical scrolling");
@@ -1195,15 +1501,21 @@ void checkVirtualization(const Options &options, const Connection &connection) {
     control_type.lVal = UIA_ListItemControlTypeId;
     ComPtr<IUIAutomationCondition> condition;
     requireHr(connection.automation->CreatePropertyCondition(UIA_ControlTypePropertyId, control_type, &condition), "CreatePropertyCondition(ListItem)");
-    auto materializedCount = [&]() {
+    auto materializedRuntimeIds = [&]() {
         ComPtr<IUIAutomationElementArray> items;
         requireHr(list->FindAll(TreeScope_Descendants, condition.Get(), &items), "FindAll(list items)");
         int count = 0;
         requireHr(items->get_Length(&count), "list item array length");
-        return count;
+        std::set<std::vector<int>> result;
+        for (int index = 0; index < count; ++index) {
+            ComPtr<IUIAutomationElement> current;
+            requireHr(items->GetElement(index, &current), "GetElement(list item)");
+            result.insert(runtimeId(current.Get()));
+        }
+        return result;
     };
     auto requireBoundedMaterialization = [&]() {
-        const int count = materializedCount();
+        const int count = static_cast<int>(materializedRuntimeIds().size());
         require(count <= options.max_materialized,
                 "virtual list materialized " + std::to_string(count) + " rows; cap is " + std::to_string(options.max_materialized));
         require(count > 0, "virtual list exposed no materialized rows");
@@ -1219,9 +1531,47 @@ void checkVirtualization(const Options &options, const Connection &connection) {
                 "Lesson 42 SizeOfSet changed between queries");
     }
 
+    const auto initial_materialized_runtime_ids = materializedRuntimeIds();
+    auto difference = [](const std::set<std::vector<int>> &left, const std::set<std::vector<int>> &right) {
+        std::set<std::vector<int>> result;
+        for (const auto &runtime_id : left) {
+            if (right.count(runtime_id) == 0) result.insert(runtime_id);
+        }
+        return result;
+    };
+    auto exactStructurePhase = [&](size_t start,
+                                   const std::set<std::vector<int>> &removed,
+                                   const std::set<std::vector<int>> &added,
+                                   StructureEventRecorder *events) {
+        if (!events) return false;
+        const auto records = events->recordsSince(start);
+        if (records.size() != removed.size() + added.size()) return false;
+        std::set<std::vector<int>> actual_removed;
+        std::set<std::vector<int>> actual_added;
+        for (const auto &record : records) {
+            if (record.type == StructureChangeType_ChildRemoved) {
+                if (record.sender_runtime_id != initial_list_runtime_id || record.changed_runtime_id.empty()) return false;
+                actual_removed.insert(record.changed_runtime_id);
+            } else if (record.type == StructureChangeType_ChildAdded) {
+                if (record.sender_runtime_id.empty() || !record.changed_runtime_id.empty()) return false;
+                actual_added.insert(record.sender_runtime_id);
+            } else {
+                return false;
+            }
+        }
+        return actual_removed == removed && actual_added == added;
+    };
+    auto sameRect = [](const RECT &left, const RECT &right) {
+        return left.left == right.left && left.top == right.top &&
+            left.right == right.right && left.bottom == right.bottom;
+    };
+    VirtualizationEventSession event_session;
+    event_session.start(connection.automation.Get(), list.Get(), item.Get());
+
     requireHr(scroll->Scroll(ScrollAmount_NoAmount, ScrollAmount_LargeIncrement), "Scroll.Scroll(LargeIncrement)");
     double scrolled_vertical_percent = initial_vertical_percent;
     ComPtr<IUIAutomationElement> replacement;
+    ComPtr<IUIAutomationElement> scrolled_item;
     const bool scrolled = waitUntil(options.timeout_ms, [&] {
         try {
             if (FAILED(scroll->get_CurrentVerticalScrollPercent(&scrolled_vertical_percent)) ||
@@ -1229,18 +1579,75 @@ void checkVirtualization(const Options &options, const Connection &connection) {
             if (findElement(connection.automation.Get(), list.Get(), options.above)) return false;
             replacement = findElement(connection.automation.Get(), list.Get(), options.replacement);
             auto current_item = findElement(connection.automation.Get(), list.Get(), options.item);
-            return replacement && current_item && runtimeId(current_item.Get()) == initial_item_runtime_id;
+            if (!replacement || !current_item || runtimeId(current_item.Get()) != initial_item_runtime_id) return false;
+            scrolled_item = current_item;
+            return true;
         } catch (...) {
             return false;
         }
     });
     require(scrolled, "large vertical scroll did not replace Lesson 40 with Lesson 48 while retaining Lesson 42");
+    require(approximately(scrolled_vertical_percent, expected_scrolled_percent, 0.01),
+            "Lesson list scrolled vertical percent is " + std::to_string(scrolled_vertical_percent) +
+            ", expected " + std::to_string(expected_scrolled_percent));
     require(runtimeId(list.Get()) == initial_list_runtime_id, "Lesson list runtime ID changed after scrolling");
     require(intProperty(replacement.Get(), UIA_PositionInSetPropertyId) == 48,
             "Lesson 48 PositionInSet is not 48");
     require(intProperty(replacement.Get(), UIA_SizeOfSetPropertyId) == options.expected_size,
             "Lesson 48 SizeOfSet changed after scrolling");
     requireBoundedMaterialization();
+    const RECT scrolled_item_rect = currentRect(scrolled_item.Get());
+    require(currentOffscreen(scrolled_item.Get()), "Lesson 42 did not become offscreen after scrolling down");
+    require(!sameRect(initial_item_rect, scrolled_item_rect),
+            "Lesson 42 BoundingRectangle did not change after scrolling down");
+
+    const auto scrolled_materialized_runtime_ids = materializedRuntimeIds();
+    const auto down_removed = difference(initial_materialized_runtime_ids, scrolled_materialized_runtime_ids);
+    const auto down_added = difference(scrolled_materialized_runtime_ids, initial_materialized_runtime_ids);
+    require(down_removed.size() == 2 && down_added.size() == 2,
+            "scrolling down did not replace exactly two materialized lesson providers");
+    auto exactEventPhase = [&](size_t property_start,
+                               size_t automation_start,
+                               size_t structure_start,
+                               double vertical_percent,
+                               const RECT &item_rect,
+                               bool item_offscreen,
+                               const std::set<std::vector<int>> &removed,
+                               const std::set<std::vector<int>> &added) {
+        PropertyEventRecorder *properties = event_session.propertyEvents();
+        AutomationEventRecorder *automation = event_session.automationEvents();
+        StructureEventRecorder *structure = event_session.structureEvents();
+        if (!properties || !automation || !structure) return false;
+        return properties->size() == property_start + 3 &&
+            properties->countExact(UIA_ScrollVerticalScrollPercentPropertyId, initial_list_runtime_id, property_start) == 1 &&
+            properties->hasDouble(UIA_ScrollVerticalScrollPercentPropertyId, initial_list_runtime_id, vertical_percent, property_start) &&
+            properties->countExact(UIA_BoundingRectanglePropertyId, initial_item_runtime_id, property_start) == 1 &&
+            properties->hasRect(UIA_BoundingRectanglePropertyId, initial_item_runtime_id, item_rect, property_start) &&
+            properties->countExact(UIA_IsOffscreenPropertyId, initial_item_runtime_id, property_start) == 1 &&
+            properties->hasBool(UIA_IsOffscreenPropertyId, initial_item_runtime_id, item_offscreen, property_start) &&
+            properties->countExact(UIA_PositionInSetPropertyId, initial_item_runtime_id, property_start) == 0 &&
+            properties->countExact(UIA_SizeOfSetPropertyId, initial_item_runtime_id, property_start) == 0 &&
+            automation->size() == automation_start + 1 &&
+            automation->countExact(UIA_LayoutInvalidatedEventId, initial_list_runtime_id, automation_start) == 1 &&
+            exactStructurePhase(structure_start, removed, added, structure);
+    };
+    const bool down_events = waitUntil(options.timeout_ms, [&] {
+        return exactEventPhase(
+            0,
+            0,
+            0,
+            expected_scrolled_percent,
+            scrolled_item_rect,
+            true,
+            down_removed,
+            down_added
+        );
+    });
+    require(down_events,
+            "scrolling down emitted an incomplete or inexact UIA property, layout, or structure event phase");
+    const size_t down_property_count = event_session.propertyEvents()->size();
+    const size_t down_automation_count = event_session.automationEvents()->size();
+    const size_t down_structure_count = event_session.structureEvents()->size();
 
     BSTR stale_name = nullptr;
     HRESULT stale_hr = above->get_CurrentName(&stale_name);
@@ -1251,6 +1658,7 @@ void checkVirtualization(const Options &options, const Connection &connection) {
     requireHr(scroll->SetScrollPercent(kNoScrollPercent, initial_vertical_percent),
               "Scroll.SetScrollPercent(initial)");
     ComPtr<IUIAutomationElement> restored_above;
+    ComPtr<IUIAutomationElement> restored_item;
     const bool restored = waitUntil(options.timeout_ms, [&] {
         try {
             double vertical_percent = 0;
@@ -1259,7 +1667,9 @@ void checkVirtualization(const Options &options, const Connection &connection) {
             restored_above = findElement(connection.automation.Get(), list.Get(), options.above);
             if (!restored_above || findElement(connection.automation.Get(), list.Get(), options.replacement)) return false;
             auto current_item = findElement(connection.automation.Get(), list.Get(), options.item);
-            return current_item && runtimeId(current_item.Get()) == initial_item_runtime_id;
+            if (!current_item || runtimeId(current_item.Get()) != initial_item_runtime_id) return false;
+            restored_item = current_item;
+            return true;
         } catch (...) {
             return false;
         }
@@ -1271,12 +1681,49 @@ void checkVirtualization(const Options &options, const Connection &connection) {
     require(runtimeId(restored_above.Get()) != initial_above_runtime_id,
             "rematerialized Lesson 40 reused its removed provider RuntimeId");
     requireBoundedMaterialization();
+    const RECT restored_item_rect = currentRect(restored_item.Get());
+    require(!currentOffscreen(restored_item.Get()), "Lesson 42 remained offscreen after restoring the scroll position");
+    require(sameRect(initial_item_rect, restored_item_rect),
+            "Lesson 42 BoundingRectangle did not return to its initial value");
+
+    const auto restored_materialized_runtime_ids = materializedRuntimeIds();
+    const auto up_removed = difference(scrolled_materialized_runtime_ids, restored_materialized_runtime_ids);
+    const auto up_added = difference(restored_materialized_runtime_ids, scrolled_materialized_runtime_ids);
+    require(up_removed.size() == 2 && up_added.size() == 2,
+            "restoring the scroll position did not replace exactly two materialized lesson providers");
+    const bool up_events = waitUntil(options.timeout_ms, [&] {
+        return exactEventPhase(
+            down_property_count,
+            down_automation_count,
+            down_structure_count,
+            expected_initial_percent,
+            restored_item_rect,
+            false,
+            up_removed,
+            up_added
+        );
+    });
+    require(up_events,
+            "restoring the scroll position emitted an incomplete or inexact UIA property, layout, or structure event phase");
+    require(event_session.propertyEvents()->invalidRecords() == 0,
+            "virtualization property event carried an invalid sender or payload");
+    require(event_session.automationEvents()->invalidRecords() == 0,
+            "virtualization automation event carried an invalid sender");
+    require(event_session.structureEvents()->count(StructureChangeType_ChildrenInvalidated) == 0,
+            "virtualization emitted ChildrenInvalidated instead of exact child deltas");
+    require(event_session.structureEvents()->invalidRemovedRuntimeIds() == 0,
+            "virtualization ChildRemoved event omitted a removed provider RuntimeId");
+    require(event_session.propertyEvents()->countExact(UIA_PositionInSetPropertyId, initial_item_runtime_id) == 0,
+            "retained Lesson 42 emitted a PositionInSet change while scrolling");
+    require(event_session.propertyEvents()->countExact(UIA_SizeOfSetPropertyId, initial_item_runtime_id) == 0,
+            "retained Lesson 42 emitted a SizeOfSet change while scrolling");
 
     stale_name = nullptr;
     stale_hr = above->get_CurrentName(&stale_name);
     SysFreeString(stale_name);
     require(unavailable(stale_hr),
             "retained Lesson 40 became available again after rematerialization");
+    event_session.stop();
 }
 
 void checkPatterns(const Options &options, const Connection &connection) {
