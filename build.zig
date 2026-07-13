@@ -473,6 +473,75 @@ pub fn build(b: *std.Build) void {
         .{ .path = "src/platform/linux/gtk_host.c", .pattern = "paint (GDK_PRIORITY_REDRAW," },
         .{ .path = "src/platform/linux/gtk_host.c", .pattern = "static void native_sdk_gpu_surface_schedule_frame_emission" },
     });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-desktop-widget-accessibility-hosts", "Verify Linux AT-SPI and Windows UI Automation canvas bridges", &.{
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "native_sdk_gtk_update_widget_accessibility" },
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "gtk_accessible_update_property" },
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "GTK_ACCESSIBLE_RELATION_POS_IN_SET" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "native_sdk_windows_update_widget_accessibility" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "case WM_GETOBJECT" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "UiaReturnRawElementProvider" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "UIA_PositionInSetPropertyId" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "ITextEditProvider" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "IGridProvider" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "IScrollProvider" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "IScrollItemProvider" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "UiaDisconnectProvider" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "widget_accessibility_next_incarnation" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "UiaRaiseTextEditTextChangedEvent" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "widgetAccessibilityCharacterStops" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-desktop-screen-reader-smokes", "Verify installed Orca and NVDA target-runner coverage", &.{
+        .{ .path = ".github/scripts/linux-accessibility-smoke.sh", .pattern = "NATIVE_A11Y_ORCA_SMOKE" },
+        .{ .path = ".github/scripts/linux-accessibility-smoke.sh", .pattern = "ORCA: Starting Atspi main event loop" },
+        .{ .path = ".github/scripts/linux-accessibility-smoke.sh", .pattern = "SPEECH OUTPUT:.*Lesson 42" },
+        .{ .path = "tests/accessibility/windows-nvda-smoke.ps1", .pattern = "https://download.nvaccess.org/releases/2026.1.1/nvda_2026.1.1.exe" },
+        .{ .path = "tests/accessibility/windows-nvda-smoke.ps1", .pattern = "6e0289eb5a3aa076eb97ea99c5d5465cb48b5ecc6a3257dc3d811f881a1747c9" },
+        .{ .path = "tests/accessibility/windows-nvda-smoke.ps1", .pattern = "--install-silent" },
+        .{ .path = "tests/accessibility/windows-nvda-smoke.ps1", .pattern = "\"-l\", \"12\"" },
+        .{ .path = ".github/workflows/ci.yml", .pattern = "orca speech-dispatcher xdotool" },
+        .{ .path = ".github/workflows/ci.yml", .pattern = "windows-nvda-smoke.ps1" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-windows-widget-accessibility-links", "Verify every Windows host build links UI Automation", &.{
+        .{ .path = "build/app.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "build/app.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "build/app.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "src/tooling/templates.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "src/tooling/templates.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "src/tooling/templates.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "examples/browser/build.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "examples/browser/build.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "examples/browser/build.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "examples/capabilities/build.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "examples/capabilities/build.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "examples/capabilities/build.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "examples/command-app/build.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "examples/command-app/build.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "examples/command-app/build.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "examples/hello/build.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "examples/hello/build.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "examples/hello/build.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "examples/native-panels/build.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "examples/native-panels/build.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "examples/native-panels/build.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "examples/native-shell/build.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "examples/native-shell/build.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "examples/native-shell/build.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "examples/next/build.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "examples/next/build.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "examples/next/build.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "examples/react/build.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "examples/react/build.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "examples/react/build.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "examples/svelte/build.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "examples/svelte/build.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "examples/svelte/build.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "examples/vue/build.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "examples/vue/build.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "examples/vue/build.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+        .{ .path = "examples/webview/build.zig", .pattern = "app_mod.linkSystemLibrary(\"oleaut32\", .{});" },
+        .{ .path = "examples/webview/build.zig", .pattern = "app_mod.linkSystemLibrary(\"uiautomationcore\", .{});" },
+        .{ .path = "examples/webview/build.zig", .pattern = "app_mod.linkSystemLibrary(\"usp10\", .{});" },
+    });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-linux-audio-buffering-clears-on-noop-resume", "Verify the Linux audio buffering flag drops when the 100% resume completes synchronously", &.{
         // The buffering flag normally drops at the PLAYING
         // state-changed message. When the refill's earlier PAUSED
@@ -767,6 +836,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const native_examples_step = b.step("test-examples-native", "Run native-first example tests");
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-accessibility-smoke", "Run accessibility smoke example tests", "examples/accessibility-smoke", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-command-app", "Run command app example tests", "examples/command-app", .owned);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-native-only", "Run native-only host example tests", "examples/native-only", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-native-shell", "Run native shell example tests", "examples/native-shell", .owned);
