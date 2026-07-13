@@ -9,6 +9,7 @@
 #include <wincodec.h>
 #include <uxtheme.h>
 #include <dwmapi.h>
+#include <usp10.h>
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -23,6 +24,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -50,6 +53,8 @@ using Microsoft::WRL::ComPtr;
  * needed — the same self-containment the WIC decoder uses further down.
  * Included last so only the Media Foundation GUIDs are affected. */
 #include <initguid.h>
+#include <uiautomation.h>
+#include <uiautomationcoreapi.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mferror.h>
@@ -114,6 +119,7 @@ enum EventKind {
     kTimer = 16,
     kAppearance = 17,
     kAudio = 18,
+    kWidgetAccessibilityAction = 19,
 };
 
 constexpr uint32_t kShortcutModifierPrimary = 1u << 0;
@@ -145,6 +151,9 @@ constexpr UINT kAudioSessionMessage = WM_APP + 45;
  * loop starves it far below the contract cadence, while posted messages
  * keep their place in the queue. */
 constexpr UINT kAudioSpectrumMessage = WM_APP + 46;
+constexpr UINT kWidgetAccessibilityActionMessage = WM_APP + 47;
+constexpr UINT kWidgetAccessibilityDisconnectMessage = WM_APP + 48;
+static std::atomic<ULONG_PTR> nextWidgetAccessibilityMessageOwner{1};
 constexpr const char *kAssetVirtualOrigin = "https://native-sdk-app.localhost";
 
 constexpr int kViewWebView = 0;
@@ -166,6 +175,83 @@ constexpr int kViewProgressIndicator = 15;
 constexpr int kViewSegmentedControl = 16;
 constexpr int kViewIconButton = 17;
 constexpr int kViewListItem = 18;
+
+constexpr uint32_t kWidgetStateEnabled = 1u << 0;
+constexpr uint32_t kWidgetStateFocused = 1u << 1;
+constexpr uint32_t kWidgetStateSelected = 1u << 2;
+constexpr uint32_t kWidgetStatePressed = 1u << 3;
+constexpr uint32_t kWidgetStateExpanded = 1u << 4;
+constexpr uint32_t kWidgetStateCollapsed = 1u << 5;
+constexpr uint32_t kWidgetStateRequired = 1u << 6;
+constexpr uint32_t kWidgetStateReadOnly = 1u << 7;
+constexpr uint32_t kWidgetStateInvalid = 1u << 8;
+constexpr uint32_t kWidgetStateHovered = 1u << 9;
+constexpr uint32_t kWidgetActionFocus = 1u << 0;
+constexpr uint32_t kWidgetActionPress = 1u << 1;
+constexpr uint32_t kWidgetActionToggle = 1u << 2;
+constexpr uint32_t kWidgetActionIncrement = 1u << 3;
+constexpr uint32_t kWidgetActionDecrement = 1u << 4;
+constexpr uint32_t kWidgetActionSetText = 1u << 5;
+constexpr uint32_t kWidgetActionSetSelection = 1u << 6;
+constexpr uint32_t kWidgetActionSelect = 1u << 7;
+
+enum WidgetAccessibilityActionKind {
+    kWidgetAccessibilityFocus = 0,
+    kWidgetAccessibilityPress = 1,
+    kWidgetAccessibilityToggle = 2,
+    kWidgetAccessibilityIncrement = 3,
+    kWidgetAccessibilityDecrement = 4,
+    kWidgetAccessibilitySetText = 5,
+    kWidgetAccessibilitySetSelection = 6,
+    kWidgetAccessibilitySelect = 7,
+    kWidgetAccessibilitySetValue = 11,
+};
+
+struct WindowsWidgetAccessibilityNode {
+    uint64_t id;
+    int has_parent_id;
+    uint64_t parent_id;
+    int role;
+    const char *label;
+    size_t label_len;
+    const char *text_value;
+    size_t text_value_len;
+    const char *placeholder;
+    size_t placeholder_len;
+    int has_text_selection;
+    size_t text_selection_start;
+    size_t text_selection_end;
+    int has_text_composition;
+    size_t text_composition_start;
+    size_t text_composition_end;
+    int has_value;
+    double value;
+    int has_grid_row_index;
+    size_t grid_row_index;
+    int has_grid_column_index;
+    size_t grid_column_index;
+    int has_grid_row_count;
+    size_t grid_row_count;
+    int has_grid_column_count;
+    size_t grid_column_count;
+    int has_list_item_index;
+    uint32_t list_item_index;
+    int has_list_item_count;
+    uint32_t list_item_count;
+    int has_scroll_offset;
+    double scroll_offset;
+    int has_scroll_viewport_extent;
+    double scroll_viewport_extent;
+    int has_scroll_content_extent;
+    double scroll_content_extent;
+    double x;
+    double y;
+    double width;
+    double height;
+    uint32_t state_flags;
+    uint32_t action_flags;
+    int focusable;
+};
 
 struct WindowsEvent {
     int kind;
@@ -226,6 +312,13 @@ struct WindowsEvent {
      * from -60 dBFS at 0 to full scale at 255). Zeros on every other
      * event kind — every emit site value-initializes the struct. */
     uint8_t audio_bands[32];
+    uint64_t widget_id;
+    int widget_action;
+    const char *widget_text;
+    size_t widget_text_len;
+    int has_widget_text_selection;
+    size_t widget_text_selection_start;
+    size_t widget_text_selection_end;
 };
 
 struct WindowsOpenDialogOpts {
@@ -407,6 +500,85 @@ struct NativeView {
     std::vector<DragRegionRect> drag_regions;
 };
 
+struct Host;
+struct HostLifetime;
+class WidgetAccessibilityProvider;
+class WidgetAccessibilityRootProvider;
+
+struct WidgetAccessibilityNodeState {
+    uint64_t id = 0;
+    uint64_t incarnation = 0;
+    uint64_t parent_id = 0;
+    bool has_parent_id = false;
+    int role = 0;
+    std::string label;
+    std::string text_value;
+    std::string placeholder;
+    size_t text_selection_start = 0;
+    size_t text_selection_end = 0;
+    bool has_text_selection = false;
+    size_t text_composition_start = 0;
+    size_t text_composition_end = 0;
+    bool has_text_composition = false;
+    double value = 0;
+    bool has_value = false;
+    size_t grid_row_index = 0;
+    size_t grid_column_index = 0;
+    size_t grid_row_count = 0;
+    size_t grid_column_count = 0;
+    bool has_grid_row_index = false;
+    bool has_grid_column_index = false;
+    bool has_grid_row_count = false;
+    bool has_grid_column_count = false;
+    uint32_t list_item_index = 0;
+    uint32_t list_item_count = 0;
+    bool has_list_item_index = false;
+    bool has_list_item_count = false;
+    double scroll_offset = 0;
+    double scroll_viewport_extent = 0;
+    double scroll_content_extent = 0;
+    bool has_scroll_offset = false;
+    bool has_scroll_viewport_extent = false;
+    bool has_scroll_content_extent = false;
+    double x = 0;
+    double y = 0;
+    double width = 0;
+    double height = 0;
+    uint32_t state_flags = 0;
+    uint32_t action_flags = 0;
+    bool focusable = false;
+};
+
+struct WidgetAccessibilityTreeState {
+    std::recursive_mutex mutex;
+    Host *host = nullptr;
+    std::shared_ptr<HostLifetime> lifetime;
+    HWND hwnd = nullptr;
+    uint64_t window_id = 0;
+    std::string view_label;
+    std::vector<uint64_t> order;
+    std::map<uint64_t, WidgetAccessibilityNodeState> nodes;
+    WidgetAccessibilityRootProvider *root = nullptr;
+};
+
+struct WidgetAccessibilityActionMessage {
+    std::weak_ptr<WidgetAccessibilityTreeState> state;
+    uint64_t window_id = 0;
+    std::string view_label;
+    uint64_t widget_id = 0;
+    uint64_t widget_incarnation = 0;
+    int action = 0;
+    uint32_t required_flag = 0;
+    std::string text;
+    bool has_selection = false;
+    size_t selection_start = 0;
+    size_t selection_end = 0;
+    bool has_expanded_target = false;
+    bool expanded_target = false;
+};
+
+static std::atomic<uint64_t> widget_accessibility_next_incarnation{1};
+
 struct Shortcut {
     std::string id;
     std::string key;
@@ -541,6 +713,12 @@ struct Host {
     std::map<uint64_t, Window> windows;
     std::map<std::string, ChildWebView> webviews;
     std::map<std::string, NativeView> native_views;
+    std::map<std::string, WidgetAccessibilityRootProvider *> widget_accessibility_roots;
+    DWORD message_thread_id = 0;
+    ULONG_PTR accessibility_message_owner = 0;
+    ULONG_PTR next_accessibility_message = 1;
+    std::map<ULONG_PTR, std::unique_ptr<WidgetAccessibilityActionMessage>> pending_accessibility_actions;
+    std::map<ULONG_PTR, IRawElementProviderSimple *> pending_accessibility_disconnects;
     uint64_t next_child_order = 1;
     std::vector<std::string> allowed_origins;
     std::vector<std::string> allowed_external_urls;
@@ -565,6 +743,7 @@ struct Host {
 };
 
 static std::string webViewKey(uint64_t window_id, const std::string &label);
+static std::string nativeViewKey(uint64_t window_id, const std::string &label);
 
 static std::string slice(const char *bytes, size_t len) {
     return bytes && len > 0 ? std::string(bytes, len) : std::string();
@@ -619,6 +798,2248 @@ static std::string narrow(const std::wstring &value) {
     std::string out((size_t)count, '\0');
     WideCharToMultiByte(CP_UTF8, 0, value.data(), (int)value.size(), out.data(), count, nullptr, nullptr);
     return out;
+}
+
+static double gpuSurfaceScale(HWND hwnd);
+
+static BSTR widgetAccessibilityBstr(const std::string &value) {
+    const std::wstring wide = widen(value);
+    return SysAllocStringLen(wide.data(), (UINT)wide.size());
+}
+
+static std::string widgetAccessibilityCompositionText(const WidgetAccessibilityNodeState &node) {
+    if (!node.has_text_composition) return std::string();
+    size_t start = std::min(node.text_composition_start, node.text_value.size());
+    size_t end = std::min(node.text_composition_end, node.text_value.size());
+    if (start > end) std::swap(start, end);
+    while (start > 0 && start < node.text_value.size() &&
+           (static_cast<unsigned char>(node.text_value[start]) & 0xc0) == 0x80) --start;
+    while (end > 0 && end < node.text_value.size() &&
+           (static_cast<unsigned char>(node.text_value[end]) & 0xc0) == 0x80) --end;
+    if (end < start) end = start;
+    return node.text_value.substr(start, end - start);
+}
+
+static std::string widgetAccessibilityChangedText(const std::string &before, const std::string &after) {
+    size_t prefix = 0;
+    while (prefix < before.size() && prefix < after.size() && before[prefix] == after[prefix]) ++prefix;
+    while (prefix > 0 && prefix < after.size() &&
+           (static_cast<unsigned char>(after[prefix]) & 0xc0) == 0x80) --prefix;
+    size_t suffix = 0;
+    while (suffix < before.size() - prefix && suffix < after.size() - prefix &&
+           before[before.size() - suffix - 1] == after[after.size() - suffix - 1]) ++suffix;
+    if (suffix > 0 && suffix < after.size() &&
+        (static_cast<unsigned char>(after[after.size() - suffix]) & 0xc0) == 0x80) suffix = 0;
+    return after.substr(prefix, after.size() - prefix - suffix);
+}
+
+static std::string widgetAccessibilityFinalizedCompositionText(
+    const WidgetAccessibilityNodeState &before,
+    const WidgetAccessibilityNodeState &after
+) {
+    if (!before.has_text_composition) return std::string();
+    const size_t start = std::min(before.text_composition_start, before.text_value.size());
+    const size_t end = std::min(std::max(before.text_composition_start, before.text_composition_end), before.text_value.size());
+    if (after.text_value.size() < start || before.text_value.compare(0, start, after.text_value, 0, start) != 0) return std::string();
+    const std::string suffix = before.text_value.substr(end);
+    if (after.text_value.size() < start + suffix.size() ||
+        after.text_value.compare(after.text_value.size() - suffix.size(), suffix.size(), suffix) != 0) return std::string();
+    return after.text_value.substr(start, after.text_value.size() - start - suffix.size());
+}
+
+static HRESULT raiseWidgetAccessibilityTextEditEvent(
+    IRawElementProviderSimple *provider,
+    enum TextEditChangeType type,
+    const std::string &payload
+) {
+    if (!provider) return E_INVALIDARG;
+    SAFEARRAY *data = SafeArrayCreateVector(VT_BSTR, 0, 1);
+    if (!data) return E_OUTOFMEMORY;
+    BSTR text = widgetAccessibilityBstr(payload);
+    if (!text) {
+        SafeArrayDestroy(data);
+        return E_OUTOFMEMORY;
+    }
+    LONG index = 0;
+    HRESULT hr = SafeArrayPutElement(data, &index, text);
+    SysFreeString(text);
+    if (SUCCEEDED(hr)) {
+        hr = UiaRaiseTextEditTextChangedEvent(provider, type, data);
+    }
+    SafeArrayDestroy(data);
+    return hr;
+}
+
+static int widgetAccessibilityControlType(int role) {
+    switch (role) {
+        case 1: return UIA_GroupControlTypeId;
+        case 2: return UIA_TextControlTypeId;
+        case 3: return UIA_ImageControlTypeId;
+        case 4: return UIA_ButtonControlTypeId;
+        case 5: return UIA_EditControlTypeId;
+        case 6: return UIA_ToolTipControlTypeId;
+        case 7: return UIA_WindowControlTypeId;
+        case 8: return UIA_MenuControlTypeId;
+        case 9: return UIA_MenuItemControlTypeId;
+        case 10: return UIA_ListControlTypeId;
+        case 11: return UIA_ListItemControlTypeId;
+        case 12: return UIA_DataItemControlTypeId;
+        case 13: return UIA_DataGridControlTypeId;
+        case 14: return UIA_DataItemControlTypeId;
+        case 15: return UIA_TabItemControlTypeId;
+        case 16: return UIA_CheckBoxControlTypeId;
+        case 17: return UIA_CheckBoxControlTypeId;
+        case 18: return UIA_SliderControlTypeId;
+        case 19: return UIA_ProgressBarControlTypeId;
+        case 20: return UIA_RadioButtonControlTypeId;
+        default: return UIA_GroupControlTypeId;
+    }
+}
+
+static PATTERNID widgetAccessibilityPatternForAvailabilityProperty(PROPERTYID property) {
+    switch (property) {
+        case UIA_IsInvokePatternAvailablePropertyId: return UIA_InvokePatternId;
+        case UIA_IsValuePatternAvailablePropertyId: return UIA_ValuePatternId;
+        case UIA_IsRangeValuePatternAvailablePropertyId: return UIA_RangeValuePatternId;
+        case UIA_IsTogglePatternAvailablePropertyId: return UIA_TogglePatternId;
+        case UIA_IsSelectionPatternAvailablePropertyId: return UIA_SelectionPatternId;
+        case UIA_IsSelectionItemPatternAvailablePropertyId: return UIA_SelectionItemPatternId;
+        case UIA_IsExpandCollapsePatternAvailablePropertyId: return UIA_ExpandCollapsePatternId;
+        case UIA_IsGridPatternAvailablePropertyId: return UIA_GridPatternId;
+        case UIA_IsGridItemPatternAvailablePropertyId: return UIA_GridItemPatternId;
+        case UIA_IsTextPatternAvailablePropertyId: return UIA_TextPatternId;
+        case UIA_IsTextEditPatternAvailablePropertyId: return UIA_TextEditPatternId;
+        default: return 0;
+    }
+}
+
+static HRESULT widgetAccessibilityNotSupported(VARIANT *value) {
+    if (!value) return E_INVALIDARG;
+    value->vt = VT_UNKNOWN;
+    return UiaGetReservedNotSupportedValue(&value->punkVal);
+}
+
+static size_t widgetAccessibilityNodeIndex(
+    const WindowsWidgetAccessibilityNode *nodes,
+    size_t count,
+    uint64_t id
+) {
+    if (!nodes || !id) return count;
+    for (size_t index = 0; index < count; ++index) {
+        if (nodes[index].id == id) return index;
+    }
+    return count;
+}
+
+static bool widgetAccessibilityLeafRole(int role) {
+    return role == 2 || role == 5 || role == 18 || role == 19;
+}
+
+static bool validWidgetAccessibilityTree(const WindowsWidgetAccessibilityNode *nodes, size_t count) {
+    for (size_t index = 0; index < count; ++index) {
+        const WindowsWidgetAccessibilityNode &node = nodes[index];
+        if (!node.id || !std::isfinite(node.x) || !std::isfinite(node.y) ||
+            !std::isfinite(node.width) || !std::isfinite(node.height) ||
+            node.width < 0 || node.height < 0 ||
+            (node.label_len > 0 && !node.label) ||
+            (node.text_value_len > 0 && !node.text_value) ||
+            (node.placeholder_len > 0 && !node.placeholder) ||
+            (node.has_list_item_index && node.list_item_index > INT_MAX) ||
+            (node.has_list_item_count && node.list_item_count > INT_MAX) ||
+            (node.has_grid_row_index && node.grid_row_index > INT_MAX) ||
+            (node.has_grid_column_index && node.grid_column_index > INT_MAX) ||
+            (node.has_grid_row_count && node.grid_row_count > INT_MAX) ||
+            (node.has_grid_column_count && node.grid_column_count > INT_MAX)) return false;
+        for (size_t duplicate = index + 1; duplicate < count; ++duplicate) {
+            if (nodes[duplicate].id == node.id) return false;
+        }
+        if (!node.has_parent_id) continue;
+        const size_t parent_index = widgetAccessibilityNodeIndex(nodes, count, node.parent_id);
+        if (parent_index == count || parent_index == index ||
+            widgetAccessibilityLeafRole(nodes[parent_index].role)) return false;
+        uint64_t parent_id = node.parent_id;
+        for (size_t depth = 0; depth < count; ++depth) {
+            const size_t ancestor_index = widgetAccessibilityNodeIndex(nodes, count, parent_id);
+            if (ancestor_index == count) return false;
+            if (!nodes[ancestor_index].has_parent_id) break;
+            parent_id = nodes[ancestor_index].parent_id;
+            if (parent_id == node.id || depth + 1 == count) return false;
+        }
+    }
+    return true;
+}
+
+struct WidgetAccessibilityRect {
+    double left = 0;
+    double top = 0;
+    double right = 0;
+    double bottom = 0;
+};
+
+static void widgetAccessibilityIntersectRect(WidgetAccessibilityRect *value, const WidgetAccessibilityRect &clip) {
+    if (!value) return;
+    value->left = std::max(value->left, clip.left);
+    value->top = std::max(value->top, clip.top);
+    value->right = std::min(value->right, clip.right);
+    value->bottom = std::min(value->bottom, clip.bottom);
+    if (value->right < value->left) value->right = value->left;
+    if (value->bottom < value->top) value->bottom = value->top;
+}
+
+static bool widgetAccessibilityRectEmpty(const WidgetAccessibilityRect &value) {
+    return value.right <= value.left || value.bottom <= value.top;
+}
+
+static bool widgetAccessibilityVisibleRectLocked(
+    const WidgetAccessibilityTreeState &state,
+    const WidgetAccessibilityNodeState &node,
+    WidgetAccessibilityRect *value,
+    bool *offscreen,
+    POINT *screen_origin,
+    double *scale_value
+) {
+    if (!state.hwnd || !value || !offscreen) return false;
+    RECT client = {};
+    POINT origin = { 0, 0 };
+    if (!GetClientRect(state.hwnd, &client) || !ClientToScreen(state.hwnd, &origin)) return false;
+    double scale = gpuSurfaceScale(state.hwnd);
+    if (!std::isfinite(scale) || scale <= 0) scale = 1;
+    WidgetAccessibilityRect clipped = { node.x, node.y, node.x + node.width, node.y + node.height };
+    widgetAccessibilityIntersectRect(&clipped, {
+        0,
+        0,
+        (client.right - client.left) / scale,
+        (client.bottom - client.top) / scale,
+    });
+    uint64_t parent_id = node.parent_id;
+    bool has_parent = node.has_parent_id;
+    size_t remaining = state.nodes.size();
+    while (has_parent && remaining-- > 0) {
+        auto parent = state.nodes.find(parent_id);
+        if (parent == state.nodes.end()) break;
+        const WidgetAccessibilityNodeState &ancestor = parent->second;
+        if (ancestor.has_scroll_offset || ancestor.has_scroll_viewport_extent || ancestor.has_scroll_content_extent) {
+            widgetAccessibilityIntersectRect(&clipped, {
+                ancestor.x,
+                ancestor.y,
+                ancestor.x + ancestor.width,
+                ancestor.y + ancestor.height,
+            });
+        }
+        parent_id = ancestor.parent_id;
+        has_parent = ancestor.has_parent_id;
+    }
+    *value = clipped;
+    *offscreen = widgetAccessibilityRectEmpty(clipped) || !IsWindowVisible(state.hwnd);
+    if (screen_origin) *screen_origin = origin;
+    if (scale_value) *scale_value = scale;
+    return true;
+}
+
+static HRESULT postWidgetAccessibilityAction(
+    const std::shared_ptr<WidgetAccessibilityTreeState> &state,
+    uint64_t id,
+    uint64_t incarnation,
+    int action,
+    uint32_t required_flag,
+    const std::string &text,
+    bool has_selection = false,
+    size_t selection_start = 0,
+    size_t selection_end = 0,
+    bool has_expanded_target = false,
+    bool expanded_target = false
+) {
+    if (!state) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::shared_ptr<HostLifetime> lifetime = state->lifetime;
+    if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::unique_ptr<WidgetAccessibilityActionMessage> message(new (std::nothrow) WidgetAccessibilityActionMessage());
+    if (!message) return E_OUTOFMEMORY;
+    {
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state->mutex);
+        if (!state->root || !state->host || !state->hwnd) return UIA_E_ELEMENTNOTAVAILABLE;
+        Host *host = state->host;
+        if (!host->running || !host->message_thread_id || !host->accessibility_message_owner) return UIA_E_ELEMENTNOTAVAILABLE;
+        auto found = state->nodes.find(id);
+        if (found == state->nodes.end() || found->second.incarnation != incarnation) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!(found->second.state_flags & kWidgetStateEnabled)) return UIA_E_ELEMENTNOTENABLED;
+        if (!(found->second.action_flags & required_flag)) return UIA_E_INVALIDOPERATION;
+        message->state = state;
+        message->window_id = state->window_id;
+        message->view_label = state->view_label;
+        message->widget_id = id;
+        message->widget_incarnation = incarnation;
+        message->action = action;
+        message->required_flag = required_flag;
+        message->text = text;
+        message->has_selection = has_selection;
+        message->selection_start = selection_start;
+        message->selection_end = selection_end;
+        message->has_expanded_target = has_expanded_target;
+        message->expanded_target = expanded_target;
+        if (has_expanded_target) {
+            for (auto &entry : host->pending_accessibility_actions) {
+                WidgetAccessibilityActionMessage *pending = entry.second.get();
+                std::shared_ptr<WidgetAccessibilityTreeState> pending_state = pending ? pending->state.lock() : nullptr;
+                if (pending && pending_state.get() == state.get() && pending->widget_id == id &&
+                    pending->widget_incarnation == incarnation &&
+                    pending->has_expanded_target) {
+                    pending->expanded_target = expanded_target;
+                    return S_OK;
+                }
+            }
+        }
+        const ULONG_PTR token = host->next_accessibility_message++;
+        host->pending_accessibility_actions[token] = std::move(message);
+        if (PostThreadMessageW(
+                host->message_thread_id,
+                kWidgetAccessibilityActionMessage,
+                token,
+                (LPARAM)host->accessibility_message_owner
+            )) return S_OK;
+        host->pending_accessibility_actions.erase(token);
+    }
+    return UIA_E_ELEMENTNOTAVAILABLE;
+}
+
+static std::vector<int> widgetAccessibilityRuntimeId(IRawElementProviderSimple *provider) {
+    std::vector<int> result;
+    HUIANODE node = nullptr;
+    SAFEARRAY *runtime_id = nullptr;
+    if (provider && SUCCEEDED(UiaNodeFromProvider(provider, &node)) && node) {
+        if (SUCCEEDED(UiaGetRuntimeId(node, &runtime_id)) && runtime_id) {
+            LONG lower = 0;
+            LONG upper = -1;
+            if (SUCCEEDED(SafeArrayGetLBound(runtime_id, 1, &lower)) &&
+                SUCCEEDED(SafeArrayGetUBound(runtime_id, 1, &upper))) {
+                result.reserve((size_t)std::max<LONG>(0, upper - lower + 1));
+                for (LONG index = lower; index <= upper; ++index) {
+                    int item = 0;
+                    if (FAILED(SafeArrayGetElement(runtime_id, &index, &item))) { result.clear(); break; }
+                    result.push_back(item);
+                }
+            }
+            SafeArrayDestroy(runtime_id);
+        }
+        UiaNodeRelease(node);
+    }
+    return result;
+}
+
+static void disconnectWidgetAccessibilityProvider(IRawElementProviderSimple *provider, Host *retry_host) {
+    if (!provider) return;
+    const HRESULT hr = UiaDisconnectProvider(provider);
+    if (hr == RPC_E_CANTCALLOUT_ININPUTSYNCCALL && retry_host) {
+        std::shared_ptr<HostLifetime> lifetime = retry_host->lifetime;
+        if (lifetime) {
+            std::lock_guard<std::recursive_mutex> guard(lifetime->mutex);
+            if (lifetime->alive && retry_host->running && retry_host->message_thread_id && retry_host->accessibility_message_owner) {
+                const ULONG_PTR token = retry_host->next_accessibility_message++;
+                provider->AddRef();
+                retry_host->pending_accessibility_disconnects[token] = provider;
+                if (PostThreadMessageW(
+                        retry_host->message_thread_id,
+                        kWidgetAccessibilityDisconnectMessage,
+                        token,
+                        (LPARAM)retry_host->accessibility_message_owner
+                    )) return;
+                retry_host->pending_accessibility_disconnects.erase(token);
+                provider->Release();
+            }
+        }
+    }
+    if (FAILED(hr)) {
+        char message[96];
+        snprintf(message, sizeof(message), "Native SDK: UiaDisconnectProvider failed (0x%08lx)\n", (unsigned long)hr);
+        OutputDebugStringA(message);
+    }
+}
+
+class WidgetAccessibilityRootProvider;
+
+static size_t widgetAccessibilityUtf16Offset(const std::string &text, size_t utf8_offset) {
+    utf8_offset = std::min(utf8_offset, text.size());
+    while (utf8_offset > 0 && utf8_offset < text.size() &&
+           (static_cast<unsigned char>(text[utf8_offset]) & 0xc0) == 0x80) utf8_offset -= 1;
+    return widen(text.substr(0, utf8_offset)).size();
+}
+
+static size_t widgetAccessibilityUtf8Offset(const std::string &text, size_t utf16_offset) {
+    const std::wstring wide = widen(text);
+    utf16_offset = std::min(utf16_offset, wide.size());
+    if (utf16_offset > 0 && utf16_offset < wide.size() &&
+        wide[utf16_offset - 1] >= 0xd800 && wide[utf16_offset - 1] <= 0xdbff &&
+        wide[utf16_offset] >= 0xdc00 && wide[utf16_offset] <= 0xdfff) utf16_offset -= 1;
+    return narrow(wide.substr(0, utf16_offset)).size();
+}
+
+static uint32_t widgetAccessibilityCodePointAt(const std::wstring &text, size_t position, size_t *next) {
+    if (position >= text.size()) {
+        if (next) *next = text.size();
+        return 0;
+    }
+    const uint32_t first = (uint32_t)text[position];
+    if (first >= 0xd800 && first <= 0xdbff && position + 1 < text.size()) {
+        const uint32_t second = (uint32_t)text[position + 1];
+        if (second >= 0xdc00 && second <= 0xdfff) {
+            if (next) *next = position + 2;
+            return 0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00);
+        }
+    }
+    if (next) *next = position + 1;
+    return first;
+}
+
+static bool widgetAccessibilityGraphemeExtender(uint32_t code_point) {
+    return (code_point >= 0xfe00 && code_point <= 0xfe0f) ||
+           (code_point >= 0xe0100 && code_point <= 0xe01ef) ||
+           (code_point >= 0x1f3fb && code_point <= 0x1f3ff) ||
+           (code_point >= 0xe0020 && code_point <= 0xe007f);
+}
+
+static bool widgetAccessibilityRegionalIndicator(uint32_t code_point) {
+    return code_point >= 0x1f1e6 && code_point <= 0x1f1ff;
+}
+
+static std::vector<uint8_t> widgetAccessibilityCharacterStops(const std::wstring &text) {
+    std::vector<uint8_t> stops(text.size() + 1, 1);
+    for (size_t position = 0; position < text.size();) {
+        size_t next = position;
+        widgetAccessibilityCodePointAt(text, position, &next);
+        for (size_t interior = position + 1; interior < next; ++interior) stops[interior] = 0;
+        position = next;
+    }
+    if (!text.empty() && text.size() <= (size_t)INT_MAX - 1) {
+        std::vector<SCRIPT_ITEM> items(text.size() + 2);
+        int item_count = 0;
+        if (SUCCEEDED(ScriptItemize(
+                text.data(), (int)text.size(), (int)text.size() + 1,
+                nullptr, nullptr, items.data(), &item_count
+            ))) {
+            for (int item = 0; item < item_count; ++item) {
+                const int start = items[(size_t)item].iCharPos;
+                const int end = items[(size_t)item + 1].iCharPos;
+                if (start < 0 || end <= start || end > (int)text.size()) continue;
+                std::vector<SCRIPT_LOGATTR> attributes((size_t)(end - start));
+                if (FAILED(ScriptBreak(text.data() + start, end - start, &items[(size_t)item].a, attributes.data()))) continue;
+                for (int index = 0; index < end - start; ++index) {
+                    if (!attributes[(size_t)index].fCharStop) stops[(size_t)(start + index)] = 0;
+                }
+            }
+        }
+    }
+    uint32_t previous = 0;
+    size_t regional_run = 0;
+    for (size_t position = 0; position < text.size();) {
+        size_t next = position;
+        const uint32_t current = widgetAccessibilityCodePointAt(text, position, &next);
+        if (position > 0 &&
+            ((previous == L'\r' && current == L'\n') ||
+             current == 0x200d || previous == 0x200d ||
+             widgetAccessibilityGraphemeExtender(current) ||
+             (widgetAccessibilityRegionalIndicator(current) && (regional_run % 2) == 1))) {
+            stops[position] = 0;
+        }
+        regional_run = widgetAccessibilityRegionalIndicator(current) ? regional_run + 1 : 0;
+        previous = current;
+        position = next;
+    }
+    stops[0] = 1;
+    stops[text.size()] = 1;
+    return stops;
+}
+
+static size_t widgetAccessibilityCharacterFloor(const std::vector<uint8_t> &stops, size_t position) {
+    position = std::min(position, stops.size() - 1);
+    while (position > 0 && !stops[position]) --position;
+    return position;
+}
+
+static size_t widgetAccessibilityCharacterCeiling(const std::vector<uint8_t> &stops, size_t position) {
+    position = std::min(position, stops.size() - 1);
+    while (position + 1 < stops.size() && !stops[position]) ++position;
+    return position;
+}
+
+static size_t widgetAccessibilityNextCharacter(const std::wstring &text, size_t position) {
+    const std::vector<uint8_t> stops = widgetAccessibilityCharacterStops(text);
+    position = std::min(position, text.size());
+    do {
+        if (position >= text.size()) return text.size();
+        ++position;
+    } while (!stops[position]);
+    return position;
+}
+
+static size_t widgetAccessibilityPreviousCharacter(const std::wstring &text, size_t position) {
+    const std::vector<uint8_t> stops = widgetAccessibilityCharacterStops(text);
+    position = std::min(position, text.size());
+    while (position > 0) {
+        --position;
+        if (stops[position]) return position;
+    }
+    return 0;
+}
+
+static const IID kWidgetAccessibilityTextRangeInternalIid = {
+    0x2a2c78eb, 0xfdad, 0x43e9, { 0xaa, 0x36, 0x05, 0x27, 0xc4, 0x3e, 0x2e, 0x6d }
+};
+
+class WidgetAccessibilityTextRangeProvider final : public ITextRangeProvider {
+public:
+    WidgetAccessibilityTextRangeProvider(
+        std::shared_ptr<WidgetAccessibilityTreeState> state,
+        uint64_t id,
+        uint64_t incarnation,
+        size_t start,
+        size_t end
+    ) : state_(std::move(state)), id_(id), incarnation_(incarnation), start_(std::min(start, end)), end_(std::max(start, end)) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+        if (!object) return E_INVALIDARG;
+        *object = nullptr;
+        if (IsEqualIID(iid, IID_IUnknown) || IsEqualIID(iid, IID_ITextRangeProvider)) {
+            *object = static_cast<ITextRangeProvider *>(this);
+        } else if (IsEqualIID(iid, kWidgetAccessibilityTextRangeInternalIid)) {
+            *object = this;
+        } else {
+            return E_NOINTERFACE;
+        }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG remaining = --references_;
+        if (remaining == 0) delete this;
+        return remaining;
+    }
+
+    HRESULT STDMETHODCALLTYPE Clone(ITextRangeProvider **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::wstring text;
+        if (!currentText(&text)) return UIA_E_ELEMENTNOTAVAILABLE;
+        *value = new (std::nothrow) WidgetAccessibilityTextRangeProvider(state_, id_, incarnation_, start_, end_);
+        return *value ? S_OK : E_OUTOFMEMORY;
+    }
+
+    HRESULT STDMETHODCALLTYPE Compare(ITextRangeProvider *range, WINBOOL *value) override {
+        if (!range || !value) return E_INVALIDARG;
+        WidgetAccessibilityTextRangeProvider *other = nullptr;
+        if (FAILED(range->QueryInterface(kWidgetAccessibilityTextRangeInternalIid, reinterpret_cast<void **>(&other))) || !other) {
+            *value = FALSE;
+            return S_OK;
+        }
+        if (other->state_.get() != state_.get() || other->id_ != id_ || other->incarnation_ != incarnation_) { other->Release(); *value = FALSE; return S_OK; }
+        std::wstring text;
+        std::wstring other_text;
+        if (!currentText(&text) || !other->currentText(&other_text)) { other->Release(); return UIA_E_ELEMENTNOTAVAILABLE; }
+        *value = start_ == other->start_ && end_ == other->end_ ? TRUE : FALSE;
+        other->Release();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE CompareEndpoints(
+        enum TextPatternRangeEndpoint endpoint,
+        ITextRangeProvider *target_range,
+        enum TextPatternRangeEndpoint target_endpoint,
+        int *value
+    ) override {
+        if (!target_range || !value ||
+            (endpoint != TextPatternRangeEndpoint_Start && endpoint != TextPatternRangeEndpoint_End) ||
+            (target_endpoint != TextPatternRangeEndpoint_Start && target_endpoint != TextPatternRangeEndpoint_End)) return E_INVALIDARG;
+        WidgetAccessibilityTextRangeProvider *other = nullptr;
+        if (FAILED(target_range->QueryInterface(kWidgetAccessibilityTextRangeInternalIid, reinterpret_cast<void **>(&other))) || !other) return E_INVALIDARG;
+        if (other->state_.get() != state_.get() || other->id_ != id_ || other->incarnation_ != incarnation_) { other->Release(); return E_INVALIDARG; }
+        std::wstring text;
+        std::wstring other_text;
+        if (!currentText(&text) || !other->currentText(&other_text)) { other->Release(); return UIA_E_ELEMENTNOTAVAILABLE; }
+        const size_t left = endpoint == TextPatternRangeEndpoint_Start ? start_ : end_;
+        const size_t right = target_endpoint == TextPatternRangeEndpoint_Start ? other->start_ : other->end_;
+        *value = left < right ? -1 : left > right ? 1 : 0;
+        other->Release();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE ExpandToEnclosingUnit(enum TextUnit unit) override {
+        std::wstring text;
+        if (!currentText(&text)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (unit == TextUnit_Character) {
+            if (start_ == end_) {
+                if (start_ < text.size()) end_ = widgetAccessibilityNextCharacter(text, start_);
+                else if (start_ > 0) start_ = widgetAccessibilityPreviousCharacter(text, start_);
+            } else {
+                end_ = widgetAccessibilityNextCharacter(text, start_);
+            }
+        } else {
+            start_ = 0;
+            end_ = text.size();
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE FindAttribute(TEXTATTRIBUTEID, VARIANT, WINBOOL, ITextRangeProvider **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        return currentAvailable() ? S_OK : UIA_E_ELEMENTNOTAVAILABLE;
+    }
+
+    HRESULT STDMETHODCALLTYPE FindText(BSTR sought, WINBOOL backward, WINBOOL ignore_case, ITextRangeProvider **value) override {
+        if (!value || !sought) return E_INVALIDARG;
+        *value = nullptr;
+        std::wstring text;
+        if (!currentText(&text)) return UIA_E_ELEMENTNOTAVAILABLE;
+        const std::wstring needle(sought, SysStringLen(sought));
+        if (needle.empty() || needle.size() > end_ - start_) return S_OK;
+        auto matches = [&](size_t at) {
+            return CompareStringOrdinal(text.data() + at, (int)needle.size(), needle.data(), (int)needle.size(), ignore_case != FALSE) == CSTR_EQUAL;
+        };
+        size_t found = std::wstring::npos;
+        if (backward) {
+            size_t at = end_ - needle.size();
+            while (true) {
+                if (at >= start_ && matches(at)) { found = at; break; }
+                if (at == start_) break;
+                at -= 1;
+            }
+        } else {
+            for (size_t at = start_; at + needle.size() <= end_; ++at) {
+                if (matches(at)) { found = at; break; }
+            }
+        }
+        if (found != std::wstring::npos) {
+            *value = new (std::nothrow) WidgetAccessibilityTextRangeProvider(state_, id_, incarnation_, found, found + needle.size());
+            if (!*value) return E_OUTOFMEMORY;
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetAttributeValue(TEXTATTRIBUTEID, VARIANT *value) override {
+        if (!value) return E_INVALIDARG;
+        if (!currentAvailable()) return UIA_E_ELEMENTNOTAVAILABLE;
+        VariantInit(value);
+        value->vt = VT_UNKNOWN;
+        return UiaGetReservedNotSupportedValue(&value->punkVal);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetBoundingRectangles(SAFEARRAY **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::wstring text;
+        if (!currentText(&text)) return UIA_E_ELEMENTNOTAVAILABLE;
+        ULONG count = 0;
+        WidgetAccessibilityRect rect;
+        bool offscreen = true;
+        POINT origin = {};
+        double scale = 1;
+        if (start_ != end_ && visibleRect(&rect, &offscreen, &origin, &scale) && !offscreen) count = 4;
+        *value = SafeArrayCreateVector(VT_R8, 0, count);
+        if (!*value) return E_OUTOFMEMORY;
+        if (count == 0) return S_OK;
+        double left = rect.left;
+        double right = rect.right;
+        const std::vector<uint8_t> stops = widgetAccessibilityCharacterStops(text);
+        size_t total_units = 0;
+        size_t start_unit = 0;
+        size_t end_unit = 0;
+        for (size_t position = 0; position < text.size(); ++position) {
+            if (!stops[position]) continue;
+            if (position < start_) ++start_unit;
+            if (position < end_) ++end_unit;
+            ++total_units;
+        }
+        if (total_units > 0) {
+            const double width = rect.right - rect.left;
+            left = rect.left + width * (double)start_unit / (double)total_units;
+            right = rect.left + width * (double)end_unit / (double)total_units;
+        }
+        const double coordinates[4] = {
+            origin.x + left * scale,
+            origin.y + rect.top * scale,
+            (right - left) * scale,
+            (rect.bottom - rect.top) * scale,
+        };
+        for (LONG index = 0; index < 4; ++index) {
+            HRESULT hr = SafeArrayPutElement(*value, &index, const_cast<double *>(&coordinates[index]));
+            if (FAILED(hr)) { SafeArrayDestroy(*value); *value = nullptr; return hr; }
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetEnclosingElement(IRawElementProviderSimple **value) override;
+
+    HRESULT STDMETHODCALLTYPE GetText(int max_length, BSTR *value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::wstring text;
+        if (!currentText(&text)) return UIA_E_ELEMENTNOTAVAILABLE;
+        size_t length = end_ - start_;
+        if (max_length >= 0) length = std::min(length, (size_t)max_length);
+        size_t end = start_ + length;
+        const std::vector<uint8_t> stops = widgetAccessibilityCharacterStops(text);
+        end = widgetAccessibilityCharacterFloor(stops, end);
+        *value = SysAllocStringLen(text.data() + start_, (UINT)(end - start_));
+        return *value || end == start_ ? S_OK : E_OUTOFMEMORY;
+    }
+
+    HRESULT STDMETHODCALLTYPE Move(enum TextUnit unit, int count, int *value) override {
+        if (!value) return E_INVALIDARG;
+        std::wstring text;
+        if (!currentText(&text)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (count == 0) { *value = 0; return S_OK; }
+        const bool degenerate = start_ == end_;
+        if (unit != TextUnit_Character) {
+            if (degenerate) {
+                const size_t target = count < 0 ? 0 : text.size();
+                *value = target == start_ ? 0 : count < 0 ? -1 : 1;
+                start_ = target;
+                end_ = target;
+                return S_OK;
+            }
+            start_ = 0;
+            end_ = 0;
+            if (count > 0 && !text.empty()) {
+                start_ = text.size();
+                end_ = text.size();
+                *value = 1;
+            } else {
+                end_ = text.size();
+                *value = 0;
+            }
+            return S_OK;
+        }
+        size_t position = start_;
+        *value = movePosition(text, &position, count);
+        start_ = position;
+        end_ = degenerate || position >= text.size()
+            ? position
+            : widgetAccessibilityNextCharacter(text, position);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE MoveEndpointByUnit(
+        enum TextPatternRangeEndpoint endpoint,
+        enum TextUnit unit,
+        int count,
+        int *value
+    ) override {
+        if (!value) return E_INVALIDARG;
+        std::wstring text;
+        if (!currentText(&text)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (endpoint != TextPatternRangeEndpoint_Start && endpoint != TextPatternRangeEndpoint_End) return E_INVALIDARG;
+        if (unit != TextUnit_Character) {
+            size_t &position = endpoint == TextPatternRangeEndpoint_Start ? start_ : end_;
+            const size_t target = count < 0 ? 0 : count > 0 ? text.size() : position;
+            *value = target == position ? 0 : count < 0 ? -1 : 1;
+            position = target;
+        } else {
+            size_t &position = endpoint == TextPatternRangeEndpoint_Start ? start_ : end_;
+            *value = movePosition(text, &position, count);
+        }
+        if (start_ > end_) {
+            if (endpoint == TextPatternRangeEndpoint_Start) end_ = start_;
+            else start_ = end_;
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE MoveEndpointByRange(
+        enum TextPatternRangeEndpoint endpoint,
+        ITextRangeProvider *target_range,
+        enum TextPatternRangeEndpoint target_endpoint
+    ) override {
+        if (!target_range ||
+            (endpoint != TextPatternRangeEndpoint_Start && endpoint != TextPatternRangeEndpoint_End) ||
+            (target_endpoint != TextPatternRangeEndpoint_Start && target_endpoint != TextPatternRangeEndpoint_End)) return E_INVALIDARG;
+        WidgetAccessibilityTextRangeProvider *other = nullptr;
+        if (FAILED(target_range->QueryInterface(kWidgetAccessibilityTextRangeInternalIid, reinterpret_cast<void **>(&other))) || !other) return E_INVALIDARG;
+        if (other->state_.get() != state_.get() || other->id_ != id_ || other->incarnation_ != incarnation_) { other->Release(); return E_INVALIDARG; }
+        std::wstring text;
+        std::wstring other_text;
+        if (!currentText(&text) || !other->currentText(&other_text)) { other->Release(); return UIA_E_ELEMENTNOTAVAILABLE; }
+        const size_t target = target_endpoint == TextPatternRangeEndpoint_Start ? other->start_ : other->end_;
+        if (endpoint == TextPatternRangeEndpoint_Start) {
+            start_ = target;
+            if (start_ > end_) end_ = start_;
+        } else {
+            end_ = target;
+            if (end_ < start_) start_ = end_;
+        }
+        other->Release();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Select() override {
+        std::wstring text;
+        if (!currentText(&text)) return UIA_E_ELEMENTNOTAVAILABLE;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        const size_t start = widgetAccessibilityUtf8Offset(node.text_value, start_);
+        const size_t end = widgetAccessibilityUtf8Offset(node.text_value, end_);
+        return postWidgetAccessibilityAction(
+            state_, id_, incarnation_, kWidgetAccessibilitySetSelection, kWidgetActionSetSelection,
+            std::string(), true, start, end
+        );
+    }
+    HRESULT STDMETHODCALLTYPE AddToSelection() override { return UIA_E_INVALIDOPERATION; }
+    HRESULT STDMETHODCALLTYPE RemoveFromSelection() override { return UIA_E_INVALIDOPERATION; }
+    HRESULT STDMETHODCALLTYPE ScrollIntoView(WINBOOL) override {
+        WidgetAccessibilityRect rect;
+        bool offscreen = true;
+        return visibleRect(&rect, &offscreen, nullptr, nullptr)
+            ? offscreen ? UIA_E_INVALIDOPERATION : S_OK
+            : UIA_E_ELEMENTNOTAVAILABLE;
+    }
+    HRESULT STDMETHODCALLTYPE GetChildren(SAFEARRAY **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        if (!currentAvailable()) return UIA_E_ELEMENTNOTAVAILABLE;
+        *value = SafeArrayCreateVector(VT_UNKNOWN, 0, 0);
+        return *value ? S_OK : E_OUTOFMEMORY;
+    }
+
+private:
+    bool currentAvailable() const {
+        WidgetAccessibilityNodeState node;
+        return nodeValue(&node);
+    }
+
+    bool nodeValue(WidgetAccessibilityNodeState *value) const {
+        if (!value || !state_) return false;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return false;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return false;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (!state_->root || !state_->host || !state_->hwnd) return false;
+        auto found = state_->nodes.find(id_);
+        if (found == state_->nodes.end() || found->second.incarnation != incarnation_) return false;
+        *value = found->second;
+        return true;
+    }
+
+    bool currentText(std::wstring *value) {
+        if (!value) return false;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return false;
+        *value = widen(node.text_value);
+        start_ = std::min(start_, value->size());
+        end_ = std::min(end_, value->size());
+        if (start_ > end_) start_ = end_;
+        const bool degenerate = start_ == end_;
+        const std::vector<uint8_t> stops = widgetAccessibilityCharacterStops(*value);
+        start_ = widgetAccessibilityCharacterFloor(stops, start_);
+        end_ = degenerate ? start_ : widgetAccessibilityCharacterCeiling(stops, end_);
+        return true;
+    }
+
+    bool visibleRect(WidgetAccessibilityRect *value, bool *offscreen, POINT *origin, double *scale) const {
+        if (!state_) return false;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return false;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return false;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        auto found = state_->nodes.find(id_);
+        if (found == state_->nodes.end() || found->second.incarnation != incarnation_) return false;
+        return widgetAccessibilityVisibleRectLocked(*state_, found->second, value, offscreen, origin, scale);
+    }
+
+    static int movePosition(const std::wstring &text, size_t *position, int count) {
+        int moved = 0;
+        while (count > 0 && *position < text.size()) {
+            *position = widgetAccessibilityNextCharacter(text, *position);
+            count -= 1;
+            moved += 1;
+        }
+        while (count < 0 && *position > 0) {
+            *position = widgetAccessibilityPreviousCharacter(text, *position);
+            count += 1;
+            moved -= 1;
+        }
+        return moved;
+    }
+
+    std::atomic<ULONG> references_{1};
+    std::shared_ptr<WidgetAccessibilityTreeState> state_;
+    uint64_t id_ = 0;
+    uint64_t incarnation_ = 0;
+    size_t start_ = 0;
+    size_t end_ = 0;
+};
+
+static HRESULT widgetAccessibilitySingleRangeArray(ITextRangeProvider *range, SAFEARRAY **value) {
+    if (!range || !value) return E_INVALIDARG;
+    *value = SafeArrayCreateVector(VT_UNKNOWN, 0, 1);
+    if (!*value) { range->Release(); return E_OUTOFMEMORY; }
+    LONG index = 0;
+    HRESULT hr = SafeArrayPutElement(*value, &index, range);
+    range->Release();
+    if (FAILED(hr)) { SafeArrayDestroy(*value); *value = nullptr; }
+    return hr;
+}
+
+class WidgetAccessibilityProvider final : public IRawElementProviderSimple,
+                                          public IRawElementProviderFragment,
+                                          public IInvokeProvider,
+                                          public IValueProvider,
+                                          public IRangeValueProvider,
+                                          public IToggleProvider,
+                                          public ISelectionProvider,
+                                          public ISelectionItemProvider,
+                                          public IExpandCollapseProvider,
+                                          public IGridProvider,
+                                          public IGridItemProvider,
+                                          public ITextEditProvider {
+public:
+    WidgetAccessibilityProvider(std::shared_ptr<WidgetAccessibilityTreeState> state, uint64_t id, uint64_t incarnation)
+        : state_(std::move(state)), id_(id), incarnation_(incarnation) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+        if (!object) return E_INVALIDARG;
+        *object = nullptr;
+        if (IsEqualIID(iid, IID_IUnknown) || IsEqualIID(iid, IID_IRawElementProviderSimple)) *object = static_cast<IRawElementProviderSimple *>(this);
+        else if (IsEqualIID(iid, IID_IRawElementProviderFragment)) *object = static_cast<IRawElementProviderFragment *>(this);
+        else if (IsEqualIID(iid, IID_IInvokeProvider)) *object = static_cast<IInvokeProvider *>(this);
+        else if (IsEqualIID(iid, IID_IValueProvider)) *object = static_cast<IValueProvider *>(this);
+        else if (IsEqualIID(iid, IID_IRangeValueProvider)) *object = static_cast<IRangeValueProvider *>(this);
+        else if (IsEqualIID(iid, IID_IToggleProvider)) *object = static_cast<IToggleProvider *>(this);
+        else if (IsEqualIID(iid, IID_ISelectionProvider)) *object = static_cast<ISelectionProvider *>(this);
+        else if (IsEqualIID(iid, IID_ISelectionItemProvider)) *object = static_cast<ISelectionItemProvider *>(this);
+        else if (IsEqualIID(iid, IID_IExpandCollapseProvider)) *object = static_cast<IExpandCollapseProvider *>(this);
+        else if (IsEqualIID(iid, IID_IGridProvider)) *object = static_cast<IGridProvider *>(this);
+        else if (IsEqualIID(iid, IID_IGridItemProvider)) *object = static_cast<IGridItemProvider *>(this);
+        else if (IsEqualIID(iid, IID_ITextProvider)) *object = static_cast<ITextProvider *>(this);
+        else if (IsEqualIID(iid, IID_ITextEditProvider)) *object = static_cast<ITextEditProvider *>(this);
+        else return E_NOINTERFACE;
+        AddRef();
+        return S_OK;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG remaining = --references_;
+        if (remaining == 0) delete this;
+        return remaining;
+    }
+
+    HRESULT STDMETHODCALLTYPE get_ProviderOptions(enum ProviderOptions *value) override {
+        if (!value) return E_INVALIDARG;
+        *value = ProviderOptions_ServerSideProvider;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID pattern, IUnknown **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (pattern == UIA_InvokePatternId && (node.action_flags & kWidgetActionPress)) return QueryInterface(IID_IInvokeProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_ValuePatternId && (node.role == 5 || (node.action_flags & kWidgetActionSetText))) return QueryInterface(IID_IValueProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_RangeValuePatternId && node.has_value && (node.role == 18 || node.role == 19)) return QueryInterface(IID_IRangeValueProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_TogglePatternId && (node.action_flags & kWidgetActionToggle) &&
+            !(node.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed))) return QueryInterface(IID_IToggleProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_SelectionPatternId && isSelectionContainer()) return QueryInterface(IID_ISelectionProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_SelectionItemPatternId && (node.action_flags & kWidgetActionSelect)) return QueryInterface(IID_ISelectionItemProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_ExpandCollapsePatternId && (node.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed)) && (node.action_flags & kWidgetActionToggle)) return QueryInterface(IID_IExpandCollapseProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_GridPatternId && node.has_grid_row_count && node.has_grid_column_count) return QueryInterface(IID_IGridProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_GridItemPatternId && node.has_grid_row_index && node.has_grid_column_index) return QueryInterface(IID_IGridItemProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_TextPatternId && node.role == 5) return QueryInterface(IID_ITextProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_TextEditPatternId && node.role == 5) return QueryInterface(IID_ITextEditProvider, reinterpret_cast<void **>(value));
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID property, VARIANT *value) override {
+        if (!value) return E_INVALIDARG;
+        VariantInit(value);
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        const PATTERNID availability_pattern = widgetAccessibilityPatternForAvailabilityProperty(property);
+        if (availability_pattern) {
+            IUnknown *pattern = nullptr;
+            const HRESULT hr = GetPatternProvider(availability_pattern, &pattern);
+            if (FAILED(hr)) return hr;
+            value->vt = VT_BOOL;
+            value->boolVal = pattern ? VARIANT_TRUE : VARIANT_FALSE;
+            if (pattern) pattern->Release();
+            return S_OK;
+        }
+        switch (property) {
+            case UIA_ControlTypePropertyId:
+                value->vt = VT_I4;
+                value->lVal = widgetAccessibilityControlType(node.role);
+                break;
+            case UIA_NamePropertyId:
+                value->vt = VT_BSTR;
+                value->bstrVal = widgetAccessibilityBstr(node.label);
+                break;
+            case UIA_AutomationIdPropertyId:
+                value->vt = VT_BSTR;
+                value->bstrVal = SysAllocString(std::to_wstring(id_).c_str());
+                break;
+            case UIA_FrameworkIdPropertyId:
+                value->vt = VT_BSTR;
+                value->bstrVal = SysAllocString(L"Native SDK");
+                break;
+            case UIA_ValueValuePropertyId:
+                value->vt = VT_BSTR;
+                value->bstrVal = widgetAccessibilityBstr(node.text_value);
+                break;
+            case UIA_HelpTextPropertyId:
+                value->vt = VT_BSTR;
+                value->bstrVal = widgetAccessibilityBstr(node.placeholder);
+                break;
+            case UIA_IsEnabledPropertyId:
+                value->vt = VT_BOOL;
+                value->boolVal = (node.state_flags & kWidgetStateEnabled) ? VARIANT_TRUE : VARIANT_FALSE;
+                break;
+            case UIA_HasKeyboardFocusPropertyId:
+                value->vt = VT_BOOL;
+                value->boolVal = (node.state_flags & kWidgetStateFocused) ? VARIANT_TRUE : VARIANT_FALSE;
+                break;
+            case UIA_IsKeyboardFocusablePropertyId:
+                value->vt = VT_BOOL;
+                value->boolVal = node.focusable ? VARIANT_TRUE : VARIANT_FALSE;
+                break;
+            case UIA_IsRequiredForFormPropertyId:
+                value->vt = VT_BOOL;
+                value->boolVal = (node.state_flags & kWidgetStateRequired) ? VARIANT_TRUE : VARIANT_FALSE;
+                break;
+            case UIA_IsDataValidForFormPropertyId:
+                value->vt = VT_BOOL;
+                value->boolVal = (node.state_flags & kWidgetStateInvalid) ? VARIANT_FALSE : VARIANT_TRUE;
+                break;
+            case UIA_IsControlElementPropertyId:
+            case UIA_IsContentElementPropertyId:
+                value->vt = VT_BOOL;
+                value->boolVal = VARIANT_TRUE;
+                break;
+            case UIA_IsOffscreenPropertyId:
+                {
+                    WidgetAccessibilityRect rect;
+                    bool offscreen = true;
+                    if (!visibleRect(&rect, &offscreen, nullptr, nullptr)) return UIA_E_ELEMENTNOTAVAILABLE;
+                    value->vt = VT_BOOL;
+                    value->boolVal = offscreen ? VARIANT_TRUE : VARIANT_FALSE;
+                }
+                break;
+            case UIA_BoundingRectanglePropertyId:
+                {
+                    struct UiaRect rect = {};
+                    const HRESULT hr = get_BoundingRectangle(&rect);
+                    if (FAILED(hr)) return hr;
+                    value->vt = VT_ARRAY | VT_R8;
+                    value->parray = SafeArrayCreateVector(VT_R8, 0, 4);
+                    if (!value->parray) return E_OUTOFMEMORY;
+                    const double coordinates[4] = { rect.left, rect.top, rect.width, rect.height };
+                    for (LONG index = 0; index < 4; ++index) {
+                        const HRESULT put_hr = SafeArrayPutElement(value->parray, &index, const_cast<double *>(&coordinates[index]));
+                        if (FAILED(put_hr)) {
+                            VariantClear(value);
+                            return put_hr;
+                        }
+                    }
+                }
+                break;
+            case UIA_PositionInSetPropertyId:
+                if (node.has_list_item_index) {
+                    value->vt = VT_I4;
+                    value->lVal = (LONG)node.list_item_index + 1;
+                } else return widgetAccessibilityNotSupported(value);
+                break;
+            case UIA_SizeOfSetPropertyId:
+                if (node.has_list_item_count) {
+                    value->vt = VT_I4;
+                    value->lVal = (LONG)node.list_item_count;
+                } else return widgetAccessibilityNotSupported(value);
+                break;
+            case UIA_GridItemRowPropertyId:
+                if (node.has_grid_row_index) { value->vt = VT_I4; value->lVal = (LONG)node.grid_row_index; }
+                else return widgetAccessibilityNotSupported(value);
+                break;
+            case UIA_GridItemColumnPropertyId:
+                if (node.has_grid_column_index) { value->vt = VT_I4; value->lVal = (LONG)node.grid_column_index; }
+                else return widgetAccessibilityNotSupported(value);
+                break;
+            case UIA_GridRowCountPropertyId:
+                if (node.has_grid_row_count) { value->vt = VT_I4; value->lVal = (LONG)node.grid_row_count; }
+                else return widgetAccessibilityNotSupported(value);
+                break;
+            case UIA_GridColumnCountPropertyId:
+                if (node.has_grid_column_count) { value->vt = VT_I4; value->lVal = (LONG)node.grid_column_count; }
+                else return widgetAccessibilityNotSupported(value);
+                break;
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE get_HostRawElementProvider(IRawElementProviderSimple **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Navigate(enum NavigateDirection direction, IRawElementProviderFragment **value) override;
+
+    HRESULT STDMETHODCALLTYPE GetRuntimeId(SAFEARRAY **value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        *value = SafeArrayCreateVector(VT_I4, 0, 5);
+        if (!*value) return E_OUTOFMEMORY;
+        LONG index = 0;
+        int item = UiaAppendRuntimeId;
+        SafeArrayPutElement(*value, &index, &item);
+        index = 1;
+        item = (int)(id_ >> 32);
+        SafeArrayPutElement(*value, &index, &item);
+        index = 2;
+        item = (int)(id_ & 0xffffffffu);
+        SafeArrayPutElement(*value, &index, &item);
+        index = 3;
+        item = (int)(incarnation_ >> 32);
+        SafeArrayPutElement(*value, &index, &item);
+        index = 4;
+        item = (int)(incarnation_ & 0xffffffffu);
+        SafeArrayPutElement(*value, &index, &item);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE get_BoundingRectangle(struct UiaRect *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityRect rect;
+        bool offscreen = true;
+        POINT origin = {};
+        double scale = 1;
+        if (!visibleRect(&rect, &offscreen, &origin, &scale)) return UIA_E_ELEMENTNOTAVAILABLE;
+        value->left = origin.x + rect.left * scale;
+        value->top = origin.y + rect.top * scale;
+        value->width = (rect.right - rect.left) * scale;
+        value->height = (rect.bottom - rect.top) * scale;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetEmbeddedFragmentRoots(SAFEARRAY **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        WidgetAccessibilityNodeState node;
+        return nodeValue(&node) ? S_OK : UIA_E_ELEMENTNOTAVAILABLE;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetFocus() override {
+        HRESULT hr = postAction(kWidgetAccessibilityFocus, kWidgetActionFocus, std::string());
+        if (FAILED(hr)) return hr;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        HWND hwnd = nullptr;
+        {
+            std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+            hwnd = state_->hwnd;
+        }
+        if (!hwnd) return UIA_E_ELEMENTNOTAVAILABLE;
+        ::SetFocus(hwnd);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_FragmentRoot(IRawElementProviderFragmentRoot **value) override;
+
+    HRESULT STDMETHODCALLTYPE Invoke() override {
+        return postAction(kWidgetAccessibilityPress, kWidgetActionPress, std::string());
+    }
+
+    HRESULT STDMETHODCALLTYPE SetValue(LPCWSTR value) override {
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (node.state_flags & kWidgetStateReadOnly) return UIA_E_INVALIDOPERATION;
+        return postAction(kWidgetAccessibilitySetText, kWidgetActionSetText, value ? narrow(value) : std::string());
+    }
+    HRESULT STDMETHODCALLTYPE get_Value(BSTR *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        *value = widgetAccessibilityBstr(node.text_value);
+        return *value ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE get_IsReadOnly(WINBOOL *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        const bool writable = !(node.state_flags & kWidgetStateReadOnly) &&
+            ((node.role == 5 && (node.action_flags & kWidgetActionSetText)) ||
+             (node.role == 18 && (node.action_flags & (kWidgetActionIncrement | kWidgetActionDecrement))));
+        *value = writable ? FALSE : TRUE;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetValue(double value) override {
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (node.state_flags & kWidgetStateReadOnly || !(node.action_flags & (kWidgetActionIncrement | kWidgetActionDecrement))) return UIA_E_INVALIDOPERATION;
+        if (!std::isfinite(value) || value < 0 || value > 1) return E_INVALIDARG;
+        char text[64];
+        const int text_len = snprintf(text, sizeof(text), "%.17g", value);
+        if (text_len <= 0 || (size_t)text_len >= sizeof(text)) return E_FAIL;
+        std::replace(text, text + text_len, ',', '.');
+        return postAction(kWidgetAccessibilitySetValue, kWidgetActionIncrement | kWidgetActionDecrement, std::string(text, (size_t)text_len));
+    }
+    HRESULT STDMETHODCALLTYPE get_Value(double *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        *value = node.value;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_Maximum(double *value) override { if (!value) return E_INVALIDARG; WidgetAccessibilityNodeState node; if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE; *value = 1; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Minimum(double *value) override { if (!value) return E_INVALIDARG; WidgetAccessibilityNodeState node; if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE; *value = 0; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_LargeChange(double *value) override { if (!value) return E_INVALIDARG; WidgetAccessibilityNodeState node; if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE; *value = node.role == 19 ? std::numeric_limits<double>::quiet_NaN() : 0.1; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_SmallChange(double *value) override { if (!value) return E_INVALIDARG; WidgetAccessibilityNodeState node; if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE; *value = node.role == 19 ? std::numeric_limits<double>::quiet_NaN() : 0.01; return S_OK; }
+
+    HRESULT STDMETHODCALLTYPE Toggle() override { return postAction(kWidgetAccessibilityToggle, kWidgetActionToggle, std::string()); }
+    HRESULT STDMETHODCALLTYPE get_ToggleState(enum ToggleState *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        *value = (node.state_flags & kWidgetStateSelected) ? ToggleState_On : ToggleState_Off;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Select() override { return postAction(kWidgetAccessibilitySelect, kWidgetActionSelect, std::string()); }
+    HRESULT STDMETHODCALLTYPE AddToSelection() override { return Select(); }
+    HRESULT STDMETHODCALLTYPE RemoveFromSelection() override { return UIA_E_INVALIDOPERATION; }
+    HRESULT STDMETHODCALLTYPE get_IsSelected(WINBOOL *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        *value = (node.state_flags & kWidgetStateSelected) ? TRUE : FALSE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_CanSelectMultiple(WINBOOL *value) override { if (!value) return E_INVALIDARG; WidgetAccessibilityNodeState node; if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE; *value = FALSE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_IsSelectionRequired(WINBOOL *value) override { if (!value) return E_INVALIDARG; WidgetAccessibilityNodeState node; if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE; *value = FALSE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_SelectionContainer(IRawElementProviderSimple **value) override;
+
+    HRESULT STDMETHODCALLTYPE Expand() override {
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!(node.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed))) return UIA_E_INVALIDOPERATION;
+        return postWidgetAccessibilityAction(
+            state_, id_, incarnation_, kWidgetAccessibilityToggle, kWidgetActionToggle, std::string(),
+            false, 0, 0, true, true
+        );
+    }
+    HRESULT STDMETHODCALLTYPE Collapse() override {
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!(node.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed))) return UIA_E_INVALIDOPERATION;
+        return postWidgetAccessibilityAction(
+            state_, id_, incarnation_, kWidgetAccessibilityToggle, kWidgetActionToggle, std::string(),
+            false, 0, 0, true, false
+        );
+    }
+    HRESULT STDMETHODCALLTYPE get_ExpandCollapseState(enum ExpandCollapseState *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (node.state_flags & kWidgetStateExpanded) *value = ExpandCollapseState_Expanded;
+        else if (node.state_flags & kWidgetStateCollapsed) *value = ExpandCollapseState_Collapsed;
+        else *value = ExpandCollapseState_LeafNode;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetItem(int row, int column, IRawElementProviderSimple **value) override;
+    HRESULT STDMETHODCALLTYPE get_RowCount(int *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!node.has_grid_row_count || node.grid_row_count > INT_MAX) return UIA_E_INVALIDOPERATION;
+        *value = (int)node.grid_row_count;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_ColumnCount(int *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!node.has_grid_column_count || node.grid_column_count > INT_MAX) return UIA_E_INVALIDOPERATION;
+        *value = (int)node.grid_column_count;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_Row(int *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!node.has_grid_row_index || node.grid_row_index > INT_MAX) return UIA_E_INVALIDOPERATION;
+        *value = (int)node.grid_row_index;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_Column(int *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!node.has_grid_column_index || node.grid_column_index > INT_MAX) return UIA_E_INVALIDOPERATION;
+        *value = (int)node.grid_column_index;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_RowSpan(int *value) override { if (!value) return E_INVALIDARG; WidgetAccessibilityNodeState node; if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE; *value = 1; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_ColumnSpan(int *value) override { if (!value) return E_INVALIDARG; WidgetAccessibilityNodeState node; if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE; *value = 1; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_ContainingGrid(IRawElementProviderSimple **value) override;
+
+    HRESULT STDMETHODCALLTYPE GetSelection(SAFEARRAY **value) override;
+    HRESULT STDMETHODCALLTYPE GetVisibleRanges(SAFEARRAY **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        WidgetAccessibilityRect rect;
+        bool offscreen = true;
+        if (!visibleRect(&rect, &offscreen, nullptr, nullptr)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (offscreen) {
+            *value = SafeArrayCreateVector(VT_UNKNOWN, 0, 0);
+            return *value ? S_OK : E_OUTOFMEMORY;
+        }
+        auto *range = new (std::nothrow) WidgetAccessibilityTextRangeProvider(state_, id_, incarnation_, 0, widen(node.text_value).size());
+        return range ? widgetAccessibilitySingleRangeArray(range, value) : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE RangeFromChild(IRawElementProviderSimple *, ITextRangeProvider **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        WidgetAccessibilityNodeState node;
+        return nodeValue(&node) ? E_INVALIDARG : UIA_E_ELEMENTNOTAVAILABLE;
+    }
+    HRESULT STDMETHODCALLTYPE RangeFromPoint(struct UiaPoint point, ITextRangeProvider **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        const std::wstring text = widen(node.text_value);
+        const std::vector<uint8_t> stops = widgetAccessibilityCharacterStops(text);
+        WidgetAccessibilityRect rect;
+        bool offscreen = true;
+        POINT origin = {};
+        double scale = 1;
+        if (!visibleRect(&rect, &offscreen, &origin, &scale)) return UIA_E_ELEMENTNOTAVAILABLE;
+        size_t unit_count = 0;
+        for (size_t position = 0; position < text.size(); ++position) unit_count += stops[position] ? 1 : 0;
+        size_t target_unit = 0;
+        const double width = (rect.right - rect.left) * scale;
+        if (unit_count > 0 && width > 0) {
+            const double relative = std::clamp((point.x - origin.x - rect.left * scale) / width, 0.0, 1.0);
+            target_unit = (size_t)std::llround(relative * (double)unit_count);
+        }
+        size_t position = 0;
+        size_t current_unit = 0;
+        while (position < text.size() && current_unit < target_unit) {
+            position = widgetAccessibilityNextCharacter(text, position);
+            ++current_unit;
+        }
+        *value = new (std::nothrow) WidgetAccessibilityTextRangeProvider(state_, id_, incarnation_, position, position);
+        return *value ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE get_DocumentRange(ITextRangeProvider **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        *value = new (std::nothrow) WidgetAccessibilityTextRangeProvider(state_, id_, incarnation_, 0, widen(node.text_value).size());
+        return *value ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE get_SupportedTextSelection(enum SupportedTextSelection *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        *value = SupportedTextSelection_Single;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetActiveComposition(ITextRangeProvider **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!node.has_text_composition) return S_OK;
+        const size_t start = widgetAccessibilityUtf16Offset(node.text_value, node.text_composition_start);
+        const size_t end = widgetAccessibilityUtf16Offset(node.text_value, node.text_composition_end);
+        *value = new (std::nothrow) WidgetAccessibilityTextRangeProvider(state_, id_, incarnation_, start, end);
+        return *value ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE GetConversionTarget(ITextRangeProvider **value) override {
+        return GetActiveComposition(value);
+    }
+
+    uint64_t id() const { return id_; }
+
+private:
+    bool nodeValue(WidgetAccessibilityNodeState *value) const {
+        if (!value || !state_) return false;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return false;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return false;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (!state_->root || !state_->host || !state_->hwnd) return false;
+        auto found = state_->nodes.find(id_);
+        if (found == state_->nodes.end() || found->second.incarnation != incarnation_) return false;
+        *value = found->second;
+        return true;
+    }
+
+    bool visibleRect(WidgetAccessibilityRect *value, bool *offscreen, POINT *origin, double *scale) const {
+        if (!state_) return false;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return false;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return false;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (!state_->root || !state_->host || !state_->hwnd) return false;
+        auto found = state_->nodes.find(id_);
+        if (found == state_->nodes.end() || found->second.incarnation != incarnation_) return false;
+        return widgetAccessibilityVisibleRectLocked(*state_, found->second, value, offscreen, origin, scale);
+    }
+
+    bool isSelectionContainer() const {
+        if (!state_) return false;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return false;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return false;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        auto found = state_->nodes.find(id_);
+        if (found == state_->nodes.end() || found->second.incarnation != incarnation_) return false;
+        for (const auto &entry : state_->nodes) {
+            if (entry.second.has_parent_id && entry.second.parent_id == id_ &&
+                (entry.second.action_flags & kWidgetActionSelect)) return true;
+        }
+        return false;
+    }
+
+    HRESULT postAction(int action, uint32_t required_flag, const std::string &text) {
+        return postWidgetAccessibilityAction(state_, id_, incarnation_, action, required_flag, text);
+    }
+
+    std::atomic<ULONG> references_{1};
+    std::shared_ptr<WidgetAccessibilityTreeState> state_;
+    uint64_t id_;
+    uint64_t incarnation_;
+};
+
+class WidgetAccessibilityRootProvider final : public IRawElementProviderSimple,
+                                              public IRawElementProviderFragment,
+                                              public IRawElementProviderFragmentRoot {
+public:
+    explicit WidgetAccessibilityRootProvider(std::shared_ptr<WidgetAccessibilityTreeState> state) : state_(std::move(state)) {
+        state_->root = this;
+    }
+    ~WidgetAccessibilityRootProvider() {
+        std::vector<WidgetAccessibilityProvider *> providers;
+        {
+            std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+            if (state_->root == this) state_->root = nullptr;
+            for (auto &entry : providers_) providers.push_back(entry.second);
+            providers_.clear();
+        }
+        for (WidgetAccessibilityProvider *provider : providers) provider->Release();
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+        if (!object) return E_INVALIDARG;
+        *object = nullptr;
+        if (IsEqualIID(iid, IID_IUnknown) || IsEqualIID(iid, IID_IRawElementProviderSimple)) *object = static_cast<IRawElementProviderSimple *>(this);
+        else if (IsEqualIID(iid, IID_IRawElementProviderFragment)) *object = static_cast<IRawElementProviderFragment *>(this);
+        else if (IsEqualIID(iid, IID_IRawElementProviderFragmentRoot)) *object = static_cast<IRawElementProviderFragmentRoot *>(this);
+        else return E_NOINTERFACE;
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG remaining = --references_; if (remaining == 0) delete this; return remaining; }
+    HRESULT STDMETHODCALLTYPE get_ProviderOptions(enum ProviderOptions *value) override { if (!value) return E_INVALIDARG; *value = ProviderOptions_ServerSideProvider; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID pattern, IUnknown **value) override { (void)pattern; if (!value) return E_INVALIDARG; *value = nullptr; return available() ? S_OK : UIA_E_ELEMENTNOTAVAILABLE; }
+    HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID property, VARIANT *value) override {
+        if (!value) return E_INVALIDARG;
+        if (!available()) return UIA_E_ELEMENTNOTAVAILABLE;
+        VariantInit(value);
+        if (property == UIA_ControlTypePropertyId) { value->vt = VT_I4; value->lVal = UIA_PaneControlTypeId; }
+        else if (property == UIA_NamePropertyId) { value->vt = VT_BSTR; value->bstrVal = widgetAccessibilityBstr(state_->view_label); }
+        else if (property == UIA_FrameworkIdPropertyId) { value->vt = VT_BSTR; value->bstrVal = SysAllocString(L"Native SDK"); }
+        else if (property == UIA_IsControlElementPropertyId || property == UIA_IsContentElementPropertyId || property == UIA_IsEnabledPropertyId) { value->vt = VT_BOOL; value->boolVal = VARIANT_TRUE; }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_HostRawElementProvider(IRawElementProviderSimple **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (state_->root != this || !state_->host || !state_->hwnd) return UIA_E_ELEMENTNOTAVAILABLE;
+        return UiaHostProviderFromHwnd(state_->hwnd, value);
+    }
+    HRESULT STDMETHODCALLTYPE Navigate(enum NavigateDirection direction, IRawElementProviderFragment **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        if (!available()) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (direction == NavigateDirection_Parent) return S_OK;
+        if (direction == NavigateDirection_FirstChild || direction == NavigateDirection_LastChild) {
+            return providerForRootEdge(direction == NavigateDirection_FirstChild, value);
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetRuntimeId(SAFEARRAY **value) override { if (!value) return E_INVALIDARG; *value = nullptr; return available() ? S_OK : UIA_E_ELEMENTNOTAVAILABLE; }
+    HRESULT STDMETHODCALLTYPE get_BoundingRectangle(struct UiaRect *value) override {
+        if (!value) return E_INVALIDARG;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (state_->root != this || !state_->host || !state_->hwnd) return UIA_E_ELEMENTNOTAVAILABLE;
+        RECT rect = {};
+        POINT origin = { 0, 0 };
+        if (!GetClientRect(state_->hwnd, &rect) || !ClientToScreen(state_->hwnd, &origin)) return UIA_E_ELEMENTNOTAVAILABLE;
+        value->left = origin.x; value->top = origin.y; value->width = rect.right - rect.left; value->height = rect.bottom - rect.top;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetEmbeddedFragmentRoots(SAFEARRAY **value) override { if (!value) return E_INVALIDARG; *value = nullptr; return available() ? S_OK : UIA_E_ELEMENTNOTAVAILABLE; }
+    HRESULT STDMETHODCALLTYPE SetFocus() override {
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (state_->root != this || !state_->host || !state_->hwnd) return UIA_E_ELEMENTNOTAVAILABLE;
+        ::SetFocus(state_->hwnd);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_FragmentRoot(IRawElementProviderFragmentRoot **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        if (!available()) return UIA_E_ELEMENTNOTAVAILABLE;
+        return QueryInterface(IID_IRawElementProviderFragmentRoot, reinterpret_cast<void **>(value));
+    }
+    HRESULT STDMETHODCALLTYPE ElementProviderFromPoint(double x, double y, IRawElementProviderFragment **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (!state_->root || !state_->host || !state_->hwnd) return UIA_E_ELEMENTNOTAVAILABLE;
+        for (auto it = state_->order.rbegin(); it != state_->order.rend(); ++it) {
+            const WidgetAccessibilityNodeState &node = state_->nodes[*it];
+            WidgetAccessibilityRect rect;
+            bool offscreen = true;
+            POINT origin = {};
+            double scale = 1;
+            if (!widgetAccessibilityVisibleRectLocked(*state_, node, &rect, &offscreen, &origin, &scale) || offscreen) continue;
+            if (x >= origin.x + rect.left * scale && x < origin.x + rect.right * scale &&
+                y >= origin.y + rect.top * scale && y < origin.y + rect.bottom * scale) return providerForId(*it, value);
+        }
+        return QueryInterface(IID_IRawElementProviderFragment, reinterpret_cast<void **>(value));
+    }
+    HRESULT STDMETHODCALLTYPE GetFocus(IRawElementProviderFragment **value) override {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (!state_->root || !state_->host || !state_->hwnd) return UIA_E_ELEMENTNOTAVAILABLE;
+        for (uint64_t id : state_->order) if (state_->nodes[id].state_flags & kWidgetStateFocused) return providerForId(id, value);
+        return S_OK;
+    }
+
+    void disconnect() {
+        std::vector<WidgetAccessibilityProvider *> providers;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        Host *retry_host = nullptr;
+        {
+            std::unique_lock<std::recursive_mutex> lifetime_guard;
+            if (lifetime) lifetime_guard = std::unique_lock<std::recursive_mutex>(lifetime->mutex);
+            std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+            if (state_->root != this) return;
+            retry_host = state_->host;
+            state_->root = nullptr;
+            state_->host = nullptr;
+            state_->hwnd = nullptr;
+            state_->nodes.clear();
+            state_->order.clear();
+            for (auto &entry : providers_) providers.push_back(entry.second);
+            providers_.clear();
+        }
+        for (WidgetAccessibilityProvider *provider : providers) {
+            disconnectWidgetAccessibilityProvider(static_cast<IRawElementProviderSimple *>(provider), retry_host);
+            provider->Release();
+        }
+        disconnectWidgetAccessibilityProvider(static_cast<IRawElementProviderSimple *>(this), retry_host);
+    }
+
+    bool update(const WindowsWidgetAccessibilityNode *nodes, size_t count) {
+        std::map<uint64_t, WidgetAccessibilityNodeState> next;
+        std::vector<uint64_t> order;
+        for (size_t index = 0; index < count; index++) {
+            const WindowsWidgetAccessibilityNode &source = nodes[index];
+            WidgetAccessibilityNodeState node;
+            node.id = source.id;
+            node.has_parent_id = source.has_parent_id != 0;
+            node.parent_id = source.parent_id;
+            node.role = source.role;
+            node.label = slice(source.label, source.label_len);
+            node.text_value = slice(source.text_value, source.text_value_len);
+            node.placeholder = slice(source.placeholder, source.placeholder_len);
+            node.has_text_selection = source.has_text_selection != 0;
+            node.text_selection_start = source.text_selection_start;
+            node.text_selection_end = source.text_selection_end;
+            node.has_text_composition = source.has_text_composition != 0;
+            node.text_composition_start = source.text_composition_start;
+            node.text_composition_end = source.text_composition_end;
+            node.has_value = source.has_value != 0;
+            node.value = source.value;
+            node.has_grid_row_index = source.has_grid_row_index != 0;
+            node.grid_row_index = source.grid_row_index;
+            node.has_grid_column_index = source.has_grid_column_index != 0;
+            node.grid_column_index = source.grid_column_index;
+            node.has_grid_row_count = source.has_grid_row_count != 0;
+            node.grid_row_count = source.grid_row_count;
+            node.has_grid_column_count = source.has_grid_column_count != 0;
+            node.grid_column_count = source.grid_column_count;
+            node.has_list_item_index = source.has_list_item_index != 0;
+            node.list_item_index = source.list_item_index;
+            node.has_list_item_count = source.has_list_item_count != 0;
+            node.list_item_count = source.list_item_count;
+            node.has_scroll_offset = source.has_scroll_offset != 0;
+            node.scroll_offset = source.scroll_offset;
+            node.has_scroll_viewport_extent = source.has_scroll_viewport_extent != 0;
+            node.scroll_viewport_extent = source.scroll_viewport_extent;
+            node.has_scroll_content_extent = source.has_scroll_content_extent != 0;
+            node.scroll_content_extent = source.scroll_content_extent;
+            node.x = source.x; node.y = source.y; node.width = source.width; node.height = source.height;
+            node.state_flags = source.state_flags;
+            node.action_flags = source.action_flags;
+            node.focusable = source.focusable != 0;
+            next[node.id] = std::move(node);
+            order.push_back(source.id);
+        }
+        std::map<uint64_t, std::vector<int>> removed_runtime_ids;
+        std::vector<std::pair<uint64_t, WidgetAccessibilityProvider *>> runtime_id_requests;
+        {
+            std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+            for (const auto &entry : state_->nodes) {
+                auto replacement = next.find(entry.first);
+                const bool removed = replacement == next.end();
+                const bool reparented = !removed &&
+                    (entry.second.has_parent_id != replacement->second.has_parent_id ||
+                     (entry.second.has_parent_id && entry.second.parent_id != replacement->second.parent_id));
+                if (!removed && !reparented) continue;
+                auto provider = providers_.find(entry.first);
+                if (provider != providers_.end() && provider->second) {
+                    provider->second->AddRef();
+                    runtime_id_requests.push_back({ entry.first, provider->second });
+                }
+            }
+        }
+        for (const auto &request : runtime_id_requests) {
+            removed_runtime_ids[request.first] = widgetAccessibilityRuntimeId(
+                static_cast<IRawElementProviderSimple *>(request.second)
+            );
+            request.second->Release();
+        }
+        struct NodeDelta {
+            WidgetAccessibilityProvider *provider = nullptr;
+            WidgetAccessibilityNodeState before;
+            WidgetAccessibilityNodeState after;
+        };
+        struct StructureDelta {
+            IRawElementProviderSimple *sender = nullptr;
+            enum StructureChangeType type = StructureChangeType_ChildAdded;
+            std::vector<int> runtime_id;
+        };
+        std::vector<NodeDelta> deltas;
+        std::vector<StructureDelta> structure_deltas;
+        std::vector<WidgetAccessibilityProvider *> removed_providers;
+        bool structure_changed = false;
+        Host *disconnect_host = nullptr;
+        {
+            std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+            disconnect_host = state_->host;
+            const std::map<uint64_t, WidgetAccessibilityNodeState> previous = state_->nodes;
+            const std::vector<uint64_t> previous_order = state_->order;
+            for (auto &entry : next) {
+                auto old = previous.find(entry.first);
+                if (old != previous.end()) {
+                    entry.second.incarnation = old->second.incarnation;
+                } else {
+                    do {
+                        entry.second.incarnation = widget_accessibility_next_incarnation.fetch_add(1, std::memory_order_relaxed);
+                    } while (entry.second.incarnation == 0);
+                }
+                if (providers_.find(entry.first) == providers_.end()) {
+                    WidgetAccessibilityProvider *provider = new (std::nothrow) WidgetAccessibilityProvider(
+                        state_, entry.first, entry.second.incarnation
+                    );
+                    if (provider) providers_[entry.first] = provider;
+                }
+            }
+            auto retainProvider = [&](uint64_t id) -> IRawElementProviderSimple * {
+                IRawElementProviderSimple *provider = nullptr;
+                auto found = providers_.find(id);
+                if (found != providers_.end() && found->second) {
+                    found->second->QueryInterface(IID_IRawElementProviderSimple, reinterpret_cast<void **>(&provider));
+                }
+                return provider;
+            };
+            auto retainParent = [&](
+                const WidgetAccessibilityNodeState *node,
+                const std::map<uint64_t, WidgetAccessibilityNodeState> &tree
+            ) -> IRawElementProviderSimple * {
+                IRawElementProviderSimple *parent = nullptr;
+                if (node && node->has_parent_id && tree.find(node->parent_id) != tree.end()) {
+                    parent = retainProvider(node->parent_id);
+                }
+                if (!parent) QueryInterface(IID_IRawElementProviderSimple, reinterpret_cast<void **>(&parent));
+                return parent;
+            };
+            auto addStructureDelta = [&](const WidgetAccessibilityNodeState *node, uint64_t id, enum StructureChangeType type) {
+                StructureDelta delta;
+                delta.sender = type == StructureChangeType_ChildAdded
+                    ? retainProvider(id)
+                    : retainParent(node, previous);
+                delta.type = type;
+                if (type == StructureChangeType_ChildRemoved) {
+                    auto runtime_id = removed_runtime_ids.find(id);
+                    if (runtime_id != removed_runtime_ids.end()) delta.runtime_id = runtime_id->second;
+                }
+                if (delta.sender && (type != StructureChangeType_ChildRemoved || !delta.runtime_id.empty())) structure_deltas.push_back(delta);
+                else if (delta.sender) delta.sender->Release();
+            };
+            for (const auto &entry : next) {
+                auto old = previous.find(entry.first);
+                if (old == previous.end()) {
+                    structure_changed = true;
+                    addStructureDelta(&entry.second, entry.first, StructureChangeType_ChildAdded);
+                    continue;
+                }
+                if (old->second.has_parent_id != entry.second.has_parent_id ||
+                    (old->second.has_parent_id && old->second.parent_id != entry.second.parent_id)) {
+                    structure_changed = true;
+                    addStructureDelta(&old->second, entry.first, StructureChangeType_ChildRemoved);
+                    addStructureDelta(&entry.second, entry.first, StructureChangeType_ChildAdded);
+                }
+                auto provider = providers_.find(entry.first);
+                if (provider != providers_.end() && provider->second) {
+                    provider->second->AddRef();
+                    deltas.push_back({ provider->second, old->second, entry.second });
+                }
+            }
+            for (const auto &entry : previous) {
+                if (next.find(entry.first) != next.end()) continue;
+                structure_changed = true;
+                const bool parent_removed = entry.second.has_parent_id &&
+                    previous.find(entry.second.parent_id) != previous.end() &&
+                    next.find(entry.second.parent_id) == next.end();
+                if (!parent_removed) addStructureDelta(&entry.second, entry.first, StructureChangeType_ChildRemoved);
+                auto provider = providers_.find(entry.first);
+                if (provider != providers_.end()) {
+                    if (provider->second) removed_providers.push_back(provider->second);
+                    providers_.erase(provider);
+                }
+            }
+            if (previous_order != order && !structure_changed) {
+                structure_changed = true;
+                using ParentKey = std::pair<bool, uint64_t>;
+                std::map<ParentKey, std::vector<uint64_t>> previous_children;
+                std::map<ParentKey, std::vector<uint64_t>> next_children;
+                for (uint64_t id : previous_order) {
+                    const WidgetAccessibilityNodeState &node = previous.at(id);
+                    previous_children[{ node.has_parent_id, node.parent_id }].push_back(id);
+                }
+                for (uint64_t id : order) {
+                    const WidgetAccessibilityNodeState &node = next.at(id);
+                    next_children[{ node.has_parent_id, node.parent_id }].push_back(id);
+                }
+                for (const auto &entry : next_children) {
+                    auto old_children = previous_children.find(entry.first);
+                    if (old_children != previous_children.end() && old_children->second == entry.second) continue;
+                    StructureDelta delta;
+                    delta.sender = entry.second.empty() ? nullptr : retainParent(&next.at(entry.second[0]), next);
+                    delta.type = StructureChangeType_ChildrenReordered;
+                    if (delta.sender) structure_deltas.push_back(delta);
+                }
+            }
+            state_->nodes = next;
+            state_->order = order;
+        }
+
+        auto raiseIntProperty = [](WidgetAccessibilityProvider *provider, PROPERTYID property, int before, int after) {
+            VARIANT old_value;
+            VARIANT new_value;
+            VariantInit(&old_value);
+            VariantInit(&new_value);
+            old_value.vt = VT_I4;
+            old_value.lVal = before;
+            new_value.vt = VT_I4;
+            new_value.lVal = after;
+            UiaRaiseAutomationPropertyChangedEvent(static_cast<IRawElementProviderSimple *>(provider), property, old_value, new_value);
+        };
+        auto raiseBoolProperty = [](WidgetAccessibilityProvider *provider, PROPERTYID property, bool before, bool after) {
+            VARIANT old_value;
+            VARIANT new_value;
+            VariantInit(&old_value);
+            VariantInit(&new_value);
+            old_value.vt = VT_BOOL;
+            old_value.boolVal = before ? VARIANT_TRUE : VARIANT_FALSE;
+            new_value.vt = VT_BOOL;
+            new_value.boolVal = after ? VARIANT_TRUE : VARIANT_FALSE;
+            UiaRaiseAutomationPropertyChangedEvent(static_cast<IRawElementProviderSimple *>(provider), property, old_value, new_value);
+        };
+        auto raiseDoubleProperty = [](WidgetAccessibilityProvider *provider, PROPERTYID property, double before, double after) {
+            VARIANT old_value;
+            VARIANT new_value;
+            VariantInit(&old_value);
+            VariantInit(&new_value);
+            old_value.vt = VT_R8;
+            old_value.dblVal = before;
+            new_value.vt = VT_R8;
+            new_value.dblVal = after;
+            UiaRaiseAutomationPropertyChangedEvent(static_cast<IRawElementProviderSimple *>(provider), property, old_value, new_value);
+        };
+        auto raiseStringProperty = [](WidgetAccessibilityProvider *provider, PROPERTYID property, const std::string &before, const std::string &after) {
+            VARIANT old_value;
+            VARIANT new_value;
+            VariantInit(&old_value);
+            VariantInit(&new_value);
+            old_value.vt = VT_BSTR;
+            old_value.bstrVal = widgetAccessibilityBstr(before);
+            new_value.vt = VT_BSTR;
+            new_value.bstrVal = widgetAccessibilityBstr(after);
+            UiaRaiseAutomationPropertyChangedEvent(static_cast<IRawElementProviderSimple *>(provider), property, old_value, new_value);
+            VariantClear(&old_value);
+            VariantClear(&new_value);
+        };
+        for (const NodeDelta &delta : deltas) {
+            if (delta.before.role != delta.after.role) {
+                raiseIntProperty(
+                    delta.provider,
+                    UIA_ControlTypePropertyId,
+                    widgetAccessibilityControlType(delta.before.role),
+                    widgetAccessibilityControlType(delta.after.role)
+                );
+            }
+            const bool before_focused = (delta.before.state_flags & kWidgetStateFocused) != 0;
+            const bool after_focused = (delta.after.state_flags & kWidgetStateFocused) != 0;
+            if (before_focused != after_focused) {
+                raiseBoolProperty(delta.provider, UIA_HasKeyboardFocusPropertyId, before_focused, after_focused);
+                if (after_focused) UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple *>(delta.provider), UIA_AutomationFocusChangedEventId);
+            }
+            const bool before_enabled = (delta.before.state_flags & kWidgetStateEnabled) != 0;
+            const bool after_enabled = (delta.after.state_flags & kWidgetStateEnabled) != 0;
+            if (before_enabled != after_enabled) raiseBoolProperty(delta.provider, UIA_IsEnabledPropertyId, before_enabled, after_enabled);
+            if (delta.before.focusable != delta.after.focusable) {
+                raiseBoolProperty(delta.provider, UIA_IsKeyboardFocusablePropertyId, delta.before.focusable, delta.after.focusable);
+            }
+            const bool before_read_only = (delta.before.state_flags & kWidgetStateReadOnly) != 0;
+            const bool after_read_only = (delta.after.state_flags & kWidgetStateReadOnly) != 0;
+            if (before_read_only != after_read_only && delta.after.role == 5) {
+                raiseBoolProperty(delta.provider, UIA_ValueIsReadOnlyPropertyId, before_read_only, after_read_only);
+            }
+            if (before_read_only != after_read_only && (delta.after.role == 18 || delta.after.role == 19)) {
+                raiseBoolProperty(delta.provider, UIA_RangeValueIsReadOnlyPropertyId, before_read_only, after_read_only);
+            }
+            const bool before_selected = (delta.before.state_flags & kWidgetStateSelected) != 0;
+            const bool after_selected = (delta.after.state_flags & kWidgetStateSelected) != 0;
+            if (before_selected != after_selected && (delta.after.action_flags & kWidgetActionToggle) &&
+                !(delta.after.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed))) {
+                raiseIntProperty(delta.provider, UIA_ToggleToggleStatePropertyId,
+                    before_selected ? ToggleState_On : ToggleState_Off,
+                    after_selected ? ToggleState_On : ToggleState_Off);
+            }
+            if (!before_selected && after_selected && (delta.after.action_flags & kWidgetActionSelect)) {
+                UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple *>(delta.provider), UIA_SelectionItem_ElementSelectedEventId);
+            }
+            if (before_selected != after_selected && (delta.after.action_flags & kWidgetActionSelect)) {
+                raiseBoolProperty(delta.provider, UIA_SelectionItemIsSelectedPropertyId, before_selected, after_selected);
+            }
+            if (delta.after.role == 5 && delta.before.text_value != delta.after.text_value) {
+                raiseStringProperty(delta.provider, UIA_ValueValuePropertyId, delta.before.text_value, delta.after.text_value);
+                UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple *>(delta.provider), UIA_Text_TextChangedEventId);
+            }
+            if (delta.after.role == 5 &&
+                (delta.before.has_text_selection != delta.after.has_text_selection ||
+                delta.before.text_selection_start != delta.after.text_selection_start ||
+                delta.before.text_selection_end != delta.after.text_selection_end)) {
+                UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple *>(delta.provider), UIA_Text_TextSelectionChangedEventId);
+            }
+            if (delta.after.role == 5) {
+                const std::string before_composition = widgetAccessibilityCompositionText(delta.before);
+                const std::string after_composition = widgetAccessibilityCompositionText(delta.after);
+                if (delta.after.has_text_composition &&
+                    (!delta.before.has_text_composition || before_composition != after_composition)) {
+                    const std::string payload = delta.before.has_text_composition
+                        ? widgetAccessibilityChangedText(before_composition, after_composition)
+                        : after_composition;
+                    raiseWidgetAccessibilityTextEditEvent(
+                        static_cast<IRawElementProviderSimple *>(delta.provider),
+                        TextEditChangeType_Composition,
+                        payload
+                    );
+                } else if (delta.before.has_text_composition && !delta.after.has_text_composition) {
+                    raiseWidgetAccessibilityTextEditEvent(
+                        static_cast<IRawElementProviderSimple *>(delta.provider),
+                        TextEditChangeType_CompositionFinalized,
+                        widgetAccessibilityFinalizedCompositionText(delta.before, delta.after)
+                    );
+                }
+                if (delta.before.has_text_composition != delta.after.has_text_composition ||
+                    delta.before.text_composition_start != delta.after.text_composition_start ||
+                    (delta.before.text_composition_end != delta.after.text_composition_end &&
+                     before_composition == after_composition)) {
+                    UiaRaiseAutomationEvent(
+                        static_cast<IRawElementProviderSimple *>(delta.provider),
+                        UIA_TextEdit_ConversionTargetChangedEventId
+                    );
+                }
+            }
+            if ((delta.after.role == 18 || delta.after.role == 19) &&
+                (delta.before.has_value != delta.after.has_value || delta.before.value != delta.after.value)) {
+                raiseDoubleProperty(delta.provider, UIA_RangeValueValuePropertyId, delta.before.value, delta.after.value);
+            }
+            const bool before_expanded = (delta.before.state_flags & kWidgetStateExpanded) != 0;
+            const bool after_expanded = (delta.after.state_flags & kWidgetStateExpanded) != 0;
+            const bool before_expandable = (delta.before.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed)) != 0;
+            const bool after_expandable = (delta.after.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed)) != 0;
+            if (before_expandable && after_expandable && before_expanded != after_expanded) {
+                raiseIntProperty(delta.provider, UIA_ExpandCollapseExpandCollapseStatePropertyId,
+                    before_expanded ? ExpandCollapseState_Expanded : ExpandCollapseState_Collapsed,
+                    after_expanded ? ExpandCollapseState_Expanded : ExpandCollapseState_Collapsed);
+            }
+            if (delta.before.label != delta.after.label) {
+                raiseStringProperty(delta.provider, UIA_NamePropertyId, delta.before.label, delta.after.label);
+            }
+            if (delta.before.placeholder != delta.after.placeholder) {
+                raiseStringProperty(delta.provider, UIA_HelpTextPropertyId, delta.before.placeholder, delta.after.placeholder);
+            }
+            if (delta.before.has_list_item_index && delta.after.has_list_item_index &&
+                delta.before.list_item_index != delta.after.list_item_index) {
+                raiseIntProperty(delta.provider, UIA_PositionInSetPropertyId,
+                    (int)delta.before.list_item_index + 1, (int)delta.after.list_item_index + 1);
+            }
+            if (delta.before.has_list_item_count && delta.after.has_list_item_count &&
+                delta.before.list_item_count != delta.after.list_item_count) {
+                raiseIntProperty(delta.provider, UIA_SizeOfSetPropertyId,
+                    (int)delta.before.list_item_count, (int)delta.after.list_item_count);
+            }
+            delta.provider->Release();
+        }
+        for (const StructureDelta &delta : structure_deltas) {
+            const bool child_removed = delta.type == StructureChangeType_ChildRemoved;
+            UiaRaiseStructureChangedEvent(delta.sender, delta.type,
+                child_removed && !delta.runtime_id.empty() ? const_cast<int *>(delta.runtime_id.data()) : nullptr,
+                child_removed ? (int)delta.runtime_id.size() : 0);
+            delta.sender->Release();
+        }
+        for (WidgetAccessibilityProvider *provider : removed_providers) {
+            disconnectWidgetAccessibilityProvider(static_cast<IRawElementProviderSimple *>(provider), disconnect_host);
+            provider->Release();
+        }
+        return structure_changed;
+    }
+
+    HRESULT providerForNavigation(uint64_t id, uint64_t incarnation, enum NavigateDirection direction, IRawElementProviderFragment **value) {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        auto found = state_->nodes.find(id);
+        if (found == state_->nodes.end() || found->second.incarnation != incarnation) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (direction == NavigateDirection_Parent) {
+            if (found->second.has_parent_id && state_->nodes.find(found->second.parent_id) != state_->nodes.end()) return providerForId(found->second.parent_id, value);
+            return QueryInterface(IID_IRawElementProviderFragment, reinterpret_cast<void **>(value));
+        }
+        if (direction == NavigateDirection_FirstChild || direction == NavigateDirection_LastChild) {
+            const bool first = direction == NavigateDirection_FirstChild;
+            if (first) {
+                for (uint64_t child : state_->order) if (state_->nodes[child].has_parent_id && state_->nodes[child].parent_id == id) return providerForId(child, value);
+            } else {
+                for (auto it = state_->order.rbegin(); it != state_->order.rend(); ++it) if (state_->nodes[*it].has_parent_id && state_->nodes[*it].parent_id == id) return providerForId(*it, value);
+            }
+            return S_OK;
+        }
+        std::vector<uint64_t> siblings;
+        for (uint64_t candidate : state_->order) {
+            const WidgetAccessibilityNodeState &node = state_->nodes[candidate];
+            if (node.has_parent_id == found->second.has_parent_id && (!node.has_parent_id || node.parent_id == found->second.parent_id)) siblings.push_back(candidate);
+        }
+        auto current = std::find(siblings.begin(), siblings.end(), id);
+        if (current == siblings.end()) return S_OK;
+        if (direction == NavigateDirection_NextSibling && ++current != siblings.end()) return providerForId(*current, value);
+        if (direction == NavigateDirection_PreviousSibling && current != siblings.begin()) { --current; return providerForId(*current, value); }
+        return S_OK;
+    }
+
+    HRESULT providerForGridItem(uint64_t grid_id, uint64_t incarnation, int row, int column, IRawElementProviderSimple **value) {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        if (row < 0 || column < 0) return E_INVALIDARG;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        auto grid = state_->nodes.find(grid_id);
+        if (grid == state_->nodes.end() || grid->second.incarnation != incarnation) return UIA_E_ELEMENTNOTAVAILABLE;
+        for (uint64_t candidate_id : state_->order) {
+            const WidgetAccessibilityNodeState &candidate = state_->nodes[candidate_id];
+            if (!candidate.has_grid_row_index || !candidate.has_grid_column_index ||
+                candidate.grid_row_index != (size_t)row || candidate.grid_column_index != (size_t)column) continue;
+            uint64_t parent_id = candidate.parent_id;
+            bool has_parent = candidate.has_parent_id;
+            size_t remaining = state_->nodes.size();
+            while (has_parent && remaining-- > 0) {
+                if (parent_id == grid_id) return providerForIdSimpleLocked(candidate_id, value);
+                auto parent = state_->nodes.find(parent_id);
+                if (parent == state_->nodes.end()) break;
+                parent_id = parent->second.parent_id;
+                has_parent = parent->second.has_parent_id;
+            }
+        }
+        return UIA_E_INVALIDOPERATION;
+    }
+
+    HRESULT containingGridFor(uint64_t id, uint64_t incarnation, IRawElementProviderSimple **value) {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        auto found = state_->nodes.find(id);
+        if (found == state_->nodes.end() || found->second.incarnation != incarnation) return UIA_E_ELEMENTNOTAVAILABLE;
+        uint64_t parent_id = found->second.parent_id;
+        bool has_parent = found->second.has_parent_id;
+        size_t remaining = state_->nodes.size();
+        while (has_parent && remaining-- > 0) {
+            auto parent = state_->nodes.find(parent_id);
+            if (parent == state_->nodes.end()) break;
+            if (parent->second.role == 13) return providerForIdSimpleLocked(parent_id, value);
+            parent_id = parent->second.parent_id;
+            has_parent = parent->second.has_parent_id;
+        }
+        return UIA_E_INVALIDOPERATION;
+    }
+
+    HRESULT selectionContainerFor(uint64_t id, uint64_t incarnation, IRawElementProviderSimple **value) {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        auto found = state_->nodes.find(id);
+        if (found == state_->nodes.end() || found->second.incarnation != incarnation) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!found->second.has_parent_id) return S_OK;
+        return providerForIdSimpleLocked(found->second.parent_id, value);
+    }
+
+    HRESULT selectionFor(uint64_t id, uint64_t incarnation, SAFEARRAY **value) {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        auto found = state_->nodes.find(id);
+        if (found == state_->nodes.end() || found->second.incarnation != incarnation) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::vector<uint64_t> selected;
+        for (uint64_t candidate_id : state_->order) {
+            const WidgetAccessibilityNodeState &candidate = state_->nodes[candidate_id];
+            if (candidate.has_parent_id && candidate.parent_id == id &&
+                (candidate.state_flags & kWidgetStateSelected)) selected.push_back(candidate_id);
+        }
+        *value = SafeArrayCreateVector(VT_UNKNOWN, 0, (ULONG)selected.size());
+        if (!*value) return E_OUTOFMEMORY;
+        for (LONG index = 0; index < (LONG)selected.size(); ++index) {
+            IRawElementProviderSimple *provider = nullptr;
+            HRESULT hr = providerForIdSimpleLocked(selected[(size_t)index], &provider);
+            if (SUCCEEDED(hr) && provider) {
+                hr = SafeArrayPutElement(*value, &index, provider);
+                provider->Release();
+            }
+            if (FAILED(hr) || !provider) {
+                SafeArrayDestroy(*value);
+                *value = nullptr;
+                return FAILED(hr) ? hr : UIA_E_ELEMENTNOTAVAILABLE;
+            }
+        }
+        return S_OK;
+    }
+
+    HRESULT providerForIdSimple(uint64_t id, IRawElementProviderSimple **value) {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (state_->nodes.find(id) == state_->nodes.end()) return UIA_E_ELEMENTNOTAVAILABLE;
+        return providerForIdSimpleLocked(id, value);
+    }
+
+    HRESULT providerForIdSimple(uint64_t id, uint64_t incarnation, IRawElementProviderSimple **value) {
+        if (!value) return E_INVALIDARG;
+        *value = nullptr;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        auto found = state_->nodes.find(id);
+        if (found == state_->nodes.end() || found->second.incarnation != incarnation) return UIA_E_ELEMENTNOTAVAILABLE;
+        return providerForIdSimpleLocked(id, value);
+    }
+
+private:
+    bool available() const {
+        if (!state_) return false;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return false;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return false;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        return state_->root == this && state_->host && state_->hwnd;
+    }
+
+    HRESULT providerForRootEdge(bool first, IRawElementProviderFragment **value) {
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (first) {
+            for (uint64_t id : state_->order) if (!state_->nodes[id].has_parent_id) return providerForId(id, value);
+        } else {
+            for (auto it = state_->order.rbegin(); it != state_->order.rend(); ++it) if (!state_->nodes[*it].has_parent_id) return providerForId(*it, value);
+        }
+        return S_OK;
+    }
+    HRESULT providerForId(uint64_t id, IRawElementProviderFragment **value) {
+        auto found = providers_.find(id);
+        if (found == providers_.end()) return S_OK;
+        return found->second->QueryInterface(IID_IRawElementProviderFragment, reinterpret_cast<void **>(value));
+    }
+    HRESULT providerForIdSimpleLocked(uint64_t id, IRawElementProviderSimple **value) {
+        auto found = providers_.find(id);
+        if (found == providers_.end()) return S_OK;
+        return found->second->QueryInterface(IID_IRawElementProviderSimple, reinterpret_cast<void **>(value));
+    }
+    std::atomic<ULONG> references_{1};
+    std::shared_ptr<WidgetAccessibilityTreeState> state_;
+    std::map<uint64_t, WidgetAccessibilityProvider *> providers_;
+};
+
+HRESULT WidgetAccessibilityProvider::Navigate(enum NavigateDirection direction, IRawElementProviderFragment **value) {
+    if (!value) return E_INVALIDARG;
+    *value = nullptr;
+    std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+    if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+    if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+    if (!state_->root) return UIA_E_ELEMENTNOTAVAILABLE;
+    return state_->root->providerForNavigation(id_, incarnation_, direction, value);
+}
+
+HRESULT WidgetAccessibilityProvider::get_FragmentRoot(IRawElementProviderFragmentRoot **value) {
+    if (!value) return E_INVALIDARG;
+    *value = nullptr;
+    std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+    if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+    if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+    WidgetAccessibilityNodeState node;
+    if (!nodeValue(&node) || !state_->root) return UIA_E_ELEMENTNOTAVAILABLE;
+    return state_->root->QueryInterface(IID_IRawElementProviderFragmentRoot, reinterpret_cast<void **>(value));
+}
+
+HRESULT WidgetAccessibilityProvider::get_SelectionContainer(IRawElementProviderSimple **value) {
+    if (!value) return E_INVALIDARG;
+    *value = nullptr;
+    std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+    if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+    if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+    if (!state_->root) return UIA_E_ELEMENTNOTAVAILABLE;
+    return state_->root->selectionContainerFor(id_, incarnation_, value);
+}
+
+HRESULT WidgetAccessibilityProvider::GetItem(int row, int column, IRawElementProviderSimple **value) {
+    if (!value) return E_INVALIDARG;
+    *value = nullptr;
+    std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+    if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+    if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+    if (!state_->root) return UIA_E_ELEMENTNOTAVAILABLE;
+    return state_->root->providerForGridItem(id_, incarnation_, row, column, value);
+}
+
+HRESULT WidgetAccessibilityProvider::get_ContainingGrid(IRawElementProviderSimple **value) {
+    if (!value) return E_INVALIDARG;
+    *value = nullptr;
+    std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+    if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+    if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+    if (!state_->root) return UIA_E_ELEMENTNOTAVAILABLE;
+    return state_->root->containingGridFor(id_, incarnation_, value);
+}
+
+HRESULT WidgetAccessibilityProvider::GetSelection(SAFEARRAY **value) {
+    if (!value) return E_INVALIDARG;
+    *value = nullptr;
+    WidgetAccessibilityNodeState node;
+    if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+    if (node.role == 5) {
+        const size_t start = node.has_text_selection ? widgetAccessibilityUtf16Offset(node.text_value, node.text_selection_start) : 0;
+        const size_t end = node.has_text_selection ? widgetAccessibilityUtf16Offset(node.text_value, node.text_selection_end) : start;
+        auto *range = new (std::nothrow) WidgetAccessibilityTextRangeProvider(state_, id_, incarnation_, start, end);
+        return range ? widgetAccessibilitySingleRangeArray(range, value) : E_OUTOFMEMORY;
+    }
+    std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+    if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+    if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+    if (!state_->root) return UIA_E_ELEMENTNOTAVAILABLE;
+    return state_->root->selectionFor(id_, incarnation_, value);
+}
+
+HRESULT WidgetAccessibilityTextRangeProvider::GetEnclosingElement(IRawElementProviderSimple **value) {
+    if (!value) return E_INVALIDARG;
+    *value = nullptr;
+    std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+    if (!lifetime) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+    if (!lifetime->alive) return UIA_E_ELEMENTNOTAVAILABLE;
+    std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+    if (!state_->root) return UIA_E_ELEMENTNOTAVAILABLE;
+    return state_->root->providerForIdSimple(id_, incarnation_, value);
+}
+
+static void clearWidgetAccessibilityForView(Host *host, uint64_t window_id, const std::string &label) {
+    if (!host) return;
+    auto found = host->widget_accessibility_roots.find(nativeViewKey(window_id, label));
+    if (found == host->widget_accessibility_roots.end()) return;
+    WidgetAccessibilityRootProvider *root = found->second;
+    host->widget_accessibility_roots.erase(found);
+    root->disconnect();
+    root->Release();
 }
 
 static HWND parentWindow(Host *host) {
@@ -1647,6 +4068,7 @@ static void destroyNativeViewAndChildren(Host *host, const std::string &key) {
         if (entry.second.window_id == window_id && entry.second.parent == label) children.push_back(entry.first);
     }
     for (const std::string &child : children) destroyNativeViewAndChildren(host, child);
+    clearWidgetAccessibilityForView(host, window_id, label);
     if (found->second.hwnd) DestroyWindow(found->second.hwnd);
     host->native_views.erase(found);
 }
@@ -2395,6 +4817,17 @@ static LRESULT CALLBACK gpuSurfaceProc(HWND hwnd, UINT message, WPARAM wparam, L
     if (!view) return DefWindowProcW(hwnd, message, wparam, lparam);
     const double scale = gpuSurfaceScale(hwnd);
     switch (message) {
+        case WM_GETOBJECT:
+            if ((LONG)lparam == UiaRootObjectId && host) {
+                auto provider = host->widget_accessibility_roots.find(nativeViewKey(view->window_id, view->label));
+                if (provider != host->widget_accessibility_roots.end() && provider->second) {
+                    return UiaReturnRawElementProvider(hwnd, wparam, lparam, static_cast<IRawElementProviderSimple *>(provider->second));
+                }
+            }
+            break;
+        case WM_DESTROY:
+            UiaReturnRawElementProvider(hwnd, 0, 0, nullptr);
+            break;
         case WM_TIMER:
             if (wparam == kGpuFrameTimerId) {
                 /* Placeholder pump: arm the scheduler until the first
@@ -4689,6 +7122,93 @@ static bool createNativeWindow(Host *host, Window &window) {
     return true;
 }
 
+static bool handleWidgetAccessibilityThreadMessage(Host *host, const MSG &posted) {
+    if (posted.message != kWidgetAccessibilityActionMessage &&
+        posted.message != kWidgetAccessibilityDisconnectMessage) return false;
+    if (!host || (ULONG_PTR)posted.lParam != host->accessibility_message_owner) return true;
+    std::shared_ptr<HostLifetime> lifetime = host->lifetime;
+    if (!lifetime) return true;
+    if (posted.message == kWidgetAccessibilityActionMessage) {
+        std::unique_ptr<WidgetAccessibilityActionMessage> action;
+        EventCallback callback = nullptr;
+        void *callback_context = nullptr;
+        IRawElementProviderSimple *invoked_provider = nullptr;
+        WindowsEvent event = {};
+        {
+            std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+            auto found = host->pending_accessibility_actions.find((ULONG_PTR)posted.wParam);
+            if (found == host->pending_accessibility_actions.end()) return true;
+            action = std::move(found->second);
+            host->pending_accessibility_actions.erase(found);
+            if (!lifetime->alive || !host->callback || !action) return true;
+            std::shared_ptr<WidgetAccessibilityTreeState> state = action->state.lock();
+            if (!state) return true;
+            std::lock_guard<std::recursive_mutex> state_guard(state->mutex);
+            auto node = state->nodes.find(action->widget_id);
+            if (state->host != host || !state->root || !state->hwnd ||
+                state->window_id != action->window_id || state->view_label != action->view_label ||
+                node == state->nodes.end() || node->second.incarnation != action->widget_incarnation ||
+                !(node->second.state_flags & kWidgetStateEnabled) ||
+                !(node->second.action_flags & action->required_flag)) return true;
+            if (action->has_expanded_target) {
+                const bool expanded = (node->second.state_flags & kWidgetStateExpanded) != 0;
+                const bool collapsed = (node->second.state_flags & kWidgetStateCollapsed) != 0;
+                if (!expanded && !collapsed) return true;
+                if (expanded == action->expanded_target) return true;
+            }
+            callback = host->callback;
+            callback_context = host->callback_context;
+            event.kind = kWidgetAccessibilityAction;
+            event.window_id = action->window_id;
+            event.view_label = action->view_label.c_str();
+            event.view_label_len = action->view_label.size();
+            event.widget_id = action->widget_id;
+            event.widget_action = action->action;
+            event.widget_text = action->text.c_str();
+            event.widget_text_len = action->text.size();
+            event.has_widget_text_selection = action->has_selection ? 1 : 0;
+            event.widget_text_selection_start = action->selection_start;
+            event.widget_text_selection_end = action->selection_end;
+            if (action->action == kWidgetAccessibilityPress) {
+                state->root->providerForIdSimple(
+                    action->widget_id, action->widget_incarnation, &invoked_provider
+                );
+            }
+        }
+        callback(callback_context, &event);
+        if (invoked_provider) {
+            UiaRaiseAutomationEvent(invoked_provider, UIA_Invoke_InvokedEventId);
+            invoked_provider->Release();
+        }
+        return true;
+    }
+    IRawElementProviderSimple *provider = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> guard(lifetime->mutex);
+        auto found = host->pending_accessibility_disconnects.find((ULONG_PTR)posted.wParam);
+        if (found == host->pending_accessibility_disconnects.end()) return true;
+        provider = found->second;
+        host->pending_accessibility_disconnects.erase(found);
+    }
+    disconnectWidgetAccessibilityProvider(provider, nullptr);
+    provider->Release();
+    return true;
+}
+
+static void clearPendingWidgetAccessibilityMessages(Host *host) {
+    if (!host) return;
+    std::vector<IRawElementProviderSimple *> providers;
+    std::shared_ptr<HostLifetime> lifetime = host->lifetime;
+    if (!lifetime) return;
+    {
+        std::lock_guard<std::recursive_mutex> guard(lifetime->mutex);
+        host->pending_accessibility_actions.clear();
+        for (const auto &entry : host->pending_accessibility_disconnects) providers.push_back(entry.second);
+        host->pending_accessibility_disconnects.clear();
+    }
+    for (IRawElementProviderSimple *provider : providers) provider->Release();
+}
+
 } // namespace
 
 extern "C" {
@@ -4708,6 +7228,8 @@ Host *native_sdk_windows_create(const char *app_name, size_t app_name_len, const
     InitCommonControlsEx(&controls);
 
     Host *host = new Host();
+    host->accessibility_message_owner = nextWidgetAccessibilityMessageOwner.fetch_add(1);
+    if (!host->accessibility_message_owner) host->accessibility_message_owner = nextWidgetAccessibilityMessageOwner.fetch_add(1);
     host->app_name = slice(app_name, app_name_len);
     host->window_title = slice(window_title, window_title_len);
     host->bundle_id = slice(bundle_id, bundle_id_len);
@@ -4731,8 +7253,10 @@ Host *native_sdk_windows_create(const char *app_name, size_t app_name_len, const
 void native_sdk_windows_destroy(Host *host) {
     if (!host) return;
     std::shared_ptr<HostLifetime> lifetime = host->lifetime;
-    std::lock_guard<std::recursive_mutex> guard(lifetime->mutex);
-    lifetime->alive = false;
+    {
+        std::lock_guard<std::recursive_mutex> guard(lifetime->mutex);
+        lifetime->alive = false;
+    }
     /* DestroyWindow below dispatches WM_DESTROY/WM_ACTIVATEAPP
      * synchronously through windowProc; the run loop's handler state is
      * already gone by the time destroy is called, so those teardown
@@ -4751,14 +7275,19 @@ void native_sdk_windows_destroy(Host *host) {
     audioReleaseSession(host, true);
     removeNotificationIcon(host);
     destroyAllWindows(host);
+    clearPendingWidgetAccessibilityMessages(host);
     delete host;
 }
 
 void native_sdk_windows_run(Host *host, EventCallback callback, void *context) {
     if (!host) return;
-    host->callback = callback;
-    host->callback_context = context;
-    host->running = true;
+    {
+        std::lock_guard<std::recursive_mutex> guard(host->lifetime->mutex);
+        host->callback = callback;
+        host->callback_context = context;
+        host->running = true;
+        host->message_thread_id = GetCurrentThreadId();
+    }
     if (!host->windows.empty()) createNativeWindow(host, host->windows.begin()->second);
     WindowsEvent start = {};
     start.kind = kStart;
@@ -4770,9 +7299,15 @@ void native_sdk_windows_run(Host *host, EventCallback callback, void *context) {
         emit(host, entry.second, kWindowFrame);
     }
     MSG message = {};
-    while (host->running && GetMessageW(&message, nullptr, 0, 0) > 0) {
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (handleWidgetAccessibilityThreadMessage(host, message)) continue;
         TranslateMessage(&message);
         DispatchMessageW(&message);
+    }
+    {
+        std::lock_guard<std::recursive_mutex> guard(host->lifetime->mutex);
+        host->running = false;
+        host->message_thread_id = 0;
     }
     WindowsEvent shutdown = {};
     shutdown.kind = kShutdown;
@@ -4782,6 +7317,7 @@ void native_sdk_windows_run(Host *host, EventCallback callback, void *context) {
 
 void native_sdk_windows_stop(Host *host) {
     if (!host) return;
+    std::lock_guard<std::recursive_mutex> guard(host->lifetime->mutex);
     host->running = false;
     PostQuitMessage(0);
 }
@@ -5499,6 +8035,35 @@ int native_sdk_windows_present_gpu_surface_pixels(Host *host, uint64_t window_id
     view.gpu_presented = true;
     if (first_present) view.gpu_prompt_frame_pending = true;
     gpuSurfaceScheduleFrameEmission(view);
+    return 1;
+}
+
+int native_sdk_windows_update_widget_accessibility(Host *host, uint64_t window_id, const char *label, size_t label_len, const WindowsWidgetAccessibilityNode *nodes, size_t node_count) {
+    if (!host || !label || label_len == 0 || node_count > 64 ||
+        (node_count > 0 && !nodes) || !validWidgetAccessibilityTree(nodes, node_count)) return 0;
+    const std::string label_string = slice(label, label_len);
+    const std::string key = nativeViewKey(window_id, label_string);
+    auto view = host->native_views.find(key);
+    if (view == host->native_views.end() || view->second.kind != kViewGpuSurface || !view->second.hwnd) return 0;
+    WidgetAccessibilityRootProvider *root = nullptr;
+    bool created = false;
+    auto found = host->widget_accessibility_roots.find(key);
+    if (found == host->widget_accessibility_roots.end()) {
+        auto state = std::make_shared<WidgetAccessibilityTreeState>();
+        state->host = host;
+        state->lifetime = host->lifetime;
+        state->hwnd = view->second.hwnd;
+        state->window_id = window_id;
+        state->view_label = label_string;
+        root = new (std::nothrow) WidgetAccessibilityRootProvider(std::move(state));
+        if (!root) return 0;
+        host->widget_accessibility_roots[key] = root;
+        created = true;
+    } else {
+        root = found->second;
+    }
+    const bool structure_changed = root->update(nodes, node_count);
+    if (created && structure_changed) NotifyWinEvent(EVENT_OBJECT_REORDER, view->second.hwnd, OBJID_CLIENT, CHILDID_SELF);
     return 1;
 }
 
