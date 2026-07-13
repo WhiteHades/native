@@ -9,6 +9,7 @@ const runtime_clock = @import("clock.zig");
 const canvas_widget_runtime = @import("canvas_widget_runtime.zig");
 const runtime_canvas_widget_display = @import("canvas_widget_display.zig");
 const runtime_canvas_widget_events = @import("canvas_widget_events.zig");
+const runtime_gpu_surface_events = @import("gpu_surface_events.zig");
 
 const AutomationWidgetAction = automation_commands.AutomationWidgetAction;
 const AutomationWidgetTarget = automation_commands.AutomationWidgetTarget;
@@ -24,6 +25,11 @@ const automationInputTimestampNs = runtime_clock.automationInputTimestampNs;
 const canvasWidgetInteractionTargetExists = canvas_widget_runtime.canvasWidgetInteractionTargetExists;
 const canvasWidgetSelectableTargetExists = canvas_widget_runtime.canvasWidgetSelectableTargetExists;
 const validateViewLabel = validation.validateViewLabel;
+
+pub const CanvasWidgetAccessibilityScroll = union(enum) {
+    by: f32,
+    to: f32,
+};
 
 pub fn RuntimeAutomationWidgetDispatch(comptime Runtime: type) type {
     return struct {
@@ -405,6 +411,53 @@ pub fn RuntimeAutomationWidgetDispatch(comptime Runtime: type) type {
             try CanvasWidgetEventMethods().invalidateForCanvasWidgetDirty(self, view_index, dirty);
         }
 
+        pub fn setAutomationCanvasWidgetValue(self: *Runtime, app: runtime_api.App(Runtime), view_index: usize, id: canvas.ObjectId, value: f32) anyerror!void {
+            if (view_index >= self.view_count) return error.ViewNotFound;
+            if (!std.math.isFinite(value)) return error.InvalidCommand;
+            try focusAutomationCanvasWidget(self, view_index, id);
+            const node_index = self.views[view_index].canvasWidgetNodeIndexById(id) orelse return error.InvalidCommand;
+            const widget = self.views[view_index].widget_layout_nodes[node_index].widget;
+            if (widget.kind != .slider or widget.state.disabled) return error.InvalidCommand;
+            const dirty = try self.views[view_index].setCanvasWidgetValue(node_index, value) orelse return;
+            self.views[view_index].noteCanvasWidgetChangeEvent(id);
+            self.views[view_index].recordGpuSurfaceInputTimestamp(automationInputTimestampNs());
+            try CanvasWidgetEventMethods().invalidateForCanvasWidgetDirty(self, view_index, dirty);
+            try GpuSurfaceEventMethods(Runtime).dispatchPendingCanvasWidgetChangeEvents(self, app, view_index);
+        }
+
+        pub fn scrollAutomationCanvasWidget(self: *Runtime, app: runtime_api.App(Runtime), view_index: usize, id: canvas.ObjectId, scroll: CanvasWidgetAccessibilityScroll) anyerror!void {
+            if (view_index >= self.view_count) return error.ViewNotFound;
+            const node_index = self.views[view_index].canvasWidgetNodeIndexById(id) orelse return error.InvalidCommand;
+            const widget = self.views[view_index].widget_layout_nodes[node_index].widget;
+            if (widget.kind != .scroll_view or widget.state.disabled) return error.InvalidCommand;
+            if (widget.layout.virtualized and !canvas.widgetVirtualRuntimeScrolled(widget)) return error.InvalidCommand;
+
+            const state = self.views[view_index].canvasWidgetScrollStateById(id) orelse return error.InvalidCommand;
+            const delta = switch (scroll) {
+                .by => |fraction| by: {
+                    if (!std.math.isFinite(fraction)) return error.InvalidCommand;
+                    if (fraction == 0) return;
+                    const scaled_distance = state.viewport_extent * @abs(fraction);
+                    if (!std.math.isFinite(scaled_distance)) return error.InvalidCommand;
+                    const distance = @max(@as(f32, 24), scaled_distance);
+                    break :by if (fraction < 0) -distance else distance;
+                },
+                .to => |fraction| to: {
+                    if (!std.math.isFinite(fraction) or fraction < 0 or fraction > 1) return error.InvalidCommand;
+                    break :to state.maxOffset() * fraction - state.offset;
+                },
+            };
+            const dirty = try self.views[view_index].applyCanvasWidgetScroll(node_index, delta, .discrete, false) orelse return;
+            self.views[view_index].recordGpuSurfaceInputTimestamp(automationInputTimestampNs());
+            const previous_cursor = self.views[view_index].canvas_widget_cursor;
+            self.views[view_index].reconcileCanvasWidgetRenderStateAfterScroll(null);
+            if (previous_cursor != self.views[view_index].canvas_widget_cursor) {
+                try CanvasWidgetEventMethods().syncCanvasWidgetCursorForView(self, view_index);
+            }
+            try CanvasWidgetEventMethods().invalidateForCanvasWidgetDirty(self, view_index, dirty);
+            try GpuSurfaceEventMethods(Runtime).dispatchPendingCanvasWidgetScrollEvents(self, app, view_index);
+        }
+
         /// Replace an editable widget's text through the SAME input-event
         /// path real typing uses: focus, a select-all key, then the
         /// replacement text as a text-input event. Each step routes
@@ -593,6 +646,10 @@ pub fn RuntimeAutomationWidgetDispatch(comptime Runtime: type) type {
             return runtime_canvas_widget_events.RuntimeCanvasWidgetEvents(Runtime);
         }
     };
+}
+
+fn GpuSurfaceEventMethods(comptime Runtime: type) type {
+    return runtime_gpu_surface_events.RuntimeGpuSurfaceEvents(Runtime);
 }
 
 fn publishAutomationProvenanceError(server: anytype, view_label: []const u8, id: u64, message: []const u8) !void {
