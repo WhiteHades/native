@@ -565,6 +565,14 @@ pub fn build(b: *std.Build) void {
         .{ .path = "build/app.zig", .pattern = "\"-DNATIVE_SDK_ALLOW_WEBKITGTK_STUB\"" },
         .{ .path = "src/tooling/templates.zig", .pattern = "\"-DNATIVE_SDK_ALLOW_WEBKITGTK_STUB\"" },
     });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-macos-webkit-seam", "Verify the WebKit compile seam stays wired through the AppKit host and both macOS build graphs", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "#if !defined(NATIVE_SDK_ALLOW_WEBKIT_STUB)\n#import <WebKit/WebKit.h>" },
+        .{ .path = "build/app.zig", .pattern = "\"-DNATIVE_SDK_ALLOW_WEBKIT_STUB=1\"" },
+        .{ .path = "build/app.zig", .pattern = "if (web_layer) app_mod.linkFramework(\"WebKit\", .{});" },
+        .{ .path = "src/tooling/templates.zig", .pattern = "\"-DNATIVE_SDK_ALLOW_WEBKIT_STUB=1\"" },
+        .{ .path = "src/platform/macos/root.zig", .pattern = "pub fn nativePlatform(self: *MacPlatform) platform_mod.Platform" },
+        .{ .path = "src/app_runner/root.zig", .pattern = "if (comptime webLayerEnabled()) mac_platform.platform() else mac_platform.nativePlatform()" },
+    });
     addLayoutCheckStep(b, test_step, "test-windows-webview2-loader-layout", "Verify the vendored WebView2 loader binaries are present", &.{
         "third_party/webview2/x64/WebView2Loader.dll",
         "third_party/webview2/arm64/WebView2Loader.dll",
@@ -933,6 +941,30 @@ pub fn build(b: *std.Build) void {
     const linux_web_layer_audit_step = b.step("test-linux-web-layer-audit", "Build a native-only and a web example for Linux (Linux host with GTK4 + WebKitGTK dev packages) and audit the web layer in each ELF");
     linux_web_layer_audit_step.dependOn(&audit_native_only_elf.step);
     linux_web_layer_audit_step.dependOn(&audit_webview_elf.step);
+
+    const macos_web_layer_audit_step = b.step("test-macos-web-layer-audit", "Build a native-only and a web example for macOS and audit the WebKit load command in each Mach-O");
+    if (host_target.result.os.tag == .macos) {
+        const preprocess_native_only_appkit = b.addSystemCommand(&.{
+            "sh",
+            "-c",
+            "set -eu; active=$(mktemp); trap 'rm -f \"$active\"' EXIT; awk '!/^#(import|include)/' src/platform/macos/appkit_host.m | zig cc -E -P -x objective-c -DNATIVE_SDK_ALLOW_WEBKIT_STUB=1 - > \"$active\"; if grep -E -n 'WebKit|WK[A-Z]|WebView2|ICoreWebView2|libcef|CEF' \"$active\"; then echo 'native-only AppKit source retains browser code' >&2; exit 1; fi",
+        });
+        const build_native_only_macos = b.addSystemCommand(&.{ "zig", "build", "-Dplatform=macos" });
+        build_native_only_macos.setCwd(b.path("examples/ui-inbox"));
+        build_native_only_macos.step.dependOn(&preprocess_native_only_appkit.step);
+        const build_webview_macos = b.addSystemCommand(&.{ "zig", "build", "-Dplatform=macos", "-Dweb-engine=system" });
+        build_webview_macos.setCwd(b.path("examples/webview"));
+        const audit_native_only_macho = b.addRunArtifact(web_layer_auditor);
+        audit_native_only_macho.addArgs(&.{ "examples/ui-inbox/zig-out/bin/ui-inbox", "absent" });
+        audit_native_only_macho.has_side_effects = true;
+        audit_native_only_macho.step.dependOn(&build_native_only_macos.step);
+        const audit_webview_macho = b.addRunArtifact(web_layer_auditor);
+        audit_webview_macho.addArgs(&.{ "examples/webview/zig-out/bin/webview", "present" });
+        audit_webview_macho.has_side_effects = true;
+        audit_webview_macho.step.dependOn(&build_webview_macos.step);
+        macos_web_layer_audit_step.dependOn(&audit_native_only_macho.step);
+        macos_web_layer_audit_step.dependOn(&audit_webview_macho.step);
+    }
 
     const frontend_examples_step = b.step("test-examples-frontends", "Run frontend example tests");
     addExampleTestStep(b, host_cli_exe, frontend_examples_step, "test-example-next", "Run Next example tests", "examples/next", .owned);
