@@ -208,12 +208,24 @@ pub fn RuntimeCanvasWidgetState(comptime Runtime: type) type {
                 .toggle => try AutomationWidgetMethods(Runtime).dispatchAutomationWidgetKey(self, app, index, action.id, "space"),
                 .increment => try AutomationWidgetMethods(Runtime).dispatchAutomationWidgetKey(self, app, index, action.id, self.views[index].canvasWidgetStepKey(action.id, .increment)),
                 .decrement => try AutomationWidgetMethods(Runtime).dispatchAutomationWidgetKey(self, app, index, action.id, self.views[index].canvasWidgetStepKey(action.id, .decrement)),
+                .set_value => {
+                    const value = action.value orelse (std.fmt.parseFloat(f32, action.text) catch return error.InvalidCommand);
+                    try AutomationWidgetMethods(Runtime).setAutomationCanvasWidgetValue(self, app, index, action.id, value);
+                },
+                .scroll_by => {
+                    const fraction = std.fmt.parseFloat(f32, action.text) catch return error.InvalidCommand;
+                    try AutomationWidgetMethods(Runtime).scrollAutomationCanvasWidget(self, app, index, action.id, .{ .by = fraction });
+                },
+                .scroll_to => {
+                    const fraction = std.fmt.parseFloat(f32, action.text) catch return error.InvalidCommand;
+                    try AutomationWidgetMethods(Runtime).scrollAutomationCanvasWidget(self, app, index, action.id, .{ .to = fraction });
+                },
                 .set_text => try AutomationWidgetMethods(Runtime).setAutomationCanvasWidgetText(self, app, index, action.id, action.text),
                 .set_selection => try AutomationWidgetMethods(Runtime).editAutomationCanvasWidgetText(self, index, action.id, .{ .set_selection = action.selection orelse return error.InvalidCommand }),
                 .set_composition => try AutomationWidgetMethods(Runtime).editAutomationCanvasWidgetText(self, index, action.id, .{ .set_composition = .{ .text = action.text } }),
                 .commit_composition => try AutomationWidgetMethods(Runtime).editAutomationCanvasWidgetText(self, index, action.id, .commit_composition),
                 .cancel_composition => try AutomationWidgetMethods(Runtime).editAutomationCanvasWidgetText(self, index, action.id, .cancel_composition),
-                .select => try AutomationWidgetMethods(Runtime).selectAutomationCanvasWidget(self, index, action.id),
+                .select => try AutomationWidgetMethods(Runtime).dispatchAutomationWidgetKey(self, app, index, action.id, "space"),
                 .drag => try AutomationWidgetMethods(Runtime).dispatchAutomationCanvasWidgetDrag(self, app, index, action.id, action.text),
                 .drop_files => try AutomationWidgetMethods(Runtime).dispatchAutomationCanvasWidgetFileDrop(self, app, index, action.id, action.text),
                 .dismiss => try AutomationWidgetMethods(Runtime).dismissAutomationCanvasWidget(self, app, index, action.id),
