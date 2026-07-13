@@ -363,7 +363,7 @@ fn widgetListSemantics(layout: anytype, node_index: usize) WidgetListSemantics {
     const node = layout.nodes[node_index];
 
     const list_index = node.parent_index orelse return .{};
-    if (list_index >= layout.nodes.len or layout.nodes[list_index].widget.kind != .list) return .{};
+    if (list_index >= layout.nodes.len or semanticRole(layout.nodes[list_index].widget) != .list) return .{};
 
     if (node.widget.semantics.list_item_index) |item_index| {
         if (node.widget.semantics.list_item_count) |item_count| {
