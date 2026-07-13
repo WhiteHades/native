@@ -144,6 +144,35 @@ jobs:
       - name: Build and drive ui-inbox headless
         run: .github/scripts/linux-canvas-smoke.sh
 
+  linux-accessibility-smoke:
+    name: Linux AT-SPI Accessibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Install GTK, AT-SPI, D-Bus, Xvfb, and Orca
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev libatspi2.0-dev at-spi2-core dbus-x11 xvfb orca speech-dispatcher xdotool
+      - name: Build Native CLI and accessibility fixture
+        run: |
+          zig build -Doptimize=ReleaseFast
+          cd examples/accessibility-smoke
+          ../../zig-out/bin/native build -Dplatform=linux -Doptimize=ReleaseFast
+      - name: Drive installed fixture through external AT-SPI and Orca
+        run: .github/scripts/linux-accessibility-smoke.sh examples/accessibility-smoke/zig-out/bin/accessibility-smoke
+        env:
+          NATIVE_A11Y_ORCA_SMOKE: "1"
+          NATIVE_A11Y_ARTIFACTS_DIR: ${{ runner.temp }}/native-linux-accessibility
+      - name: Upload AT-SPI and Orca diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-accessibility-smoke
+          path: ${{ runner.temp }}/native-linux-accessibility
+          if-no-files-found: ignore
+
   windows-canvas-smoke:
     name: Windows Canvas Smoke (Wine)
     runs-on: ubuntu-latest
@@ -163,6 +192,37 @@ jobs:
       # scratch in an ubuntu-24.04 container, so no cache step).
       - name: Build and drive ui-inbox.exe under Wine
         run: .github/scripts/windows-canvas-smoke.sh
+
+  windows-accessibility-smoke:
+    name: Windows UI Automation and NVDA Accessibility
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build Native CLI and accessibility fixture
+        shell: pwsh
+        run: |
+          zig build -Doptimize=ReleaseFast
+          Push-Location examples/accessibility-smoke
+          & ..\..\zig-out\bin\native.exe build -Dplatform=windows -Doptimize=ReleaseFast
+          Pop-Location
+      - name: Drive installed fixture through external UI Automation and installed NVDA
+        shell: pwsh
+        run: |
+          .\tests\accessibility\windows-nvda-smoke.ps1 `
+            -HostExe .\examples\accessibility-smoke\zig-out\bin\accessibility-smoke.exe `
+            -ArtifactsDirectory "$env:RUNNER_TEMP\native-windows-accessibility"
+      - name: Upload UI Automation and NVDA diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-accessibility-smoke
+          path: ${{ runner.temp }}/native-windows-accessibility
+          if-no-files-found: ignore
 
   windows-effects-smoke:
     name: Windows Effects Smoke (Wine)
