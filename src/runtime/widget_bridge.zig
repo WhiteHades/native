@@ -9,6 +9,9 @@ pub const CanvasWidgetAccessibilityActionKind = enum {
     toggle,
     increment,
     decrement,
+    set_value,
+    scroll_by,
+    scroll_to,
     set_text,
     set_selection,
     set_composition,
@@ -25,6 +28,7 @@ pub const CanvasWidgetAccessibilityAction = struct {
     action: CanvasWidgetAccessibilityActionKind,
     text: []const u8 = "",
     selection: ?canvas.TextSelection = null,
+    value: ?f32 = null,
 };
 
 pub fn platformCursorFromCanvas(cursor: canvas.WidgetCursor) platform.Cursor {
@@ -204,6 +208,8 @@ pub fn canvasWidgetAccessibilityActionSupported(actions: canvas.WidgetActions, a
         .toggle => actions.toggle,
         .increment => actions.increment,
         .decrement => actions.decrement,
+        .set_value => actions.increment or actions.decrement,
+        .scroll_by, .scroll_to => actions.increment or actions.decrement,
         .set_text => actions.set_text,
         .set_selection => actions.set_selection,
         .set_composition, .commit_composition, .cancel_composition => actions.set_text,
@@ -221,6 +227,9 @@ pub fn canvasWidgetAccessibilityActionKindFromPlatform(action: platform.WidgetAc
         .toggle => .toggle,
         .increment => .increment,
         .decrement => .decrement,
+        .set_value => .set_value,
+        .scroll_by => .scroll_by,
+        .scroll_to => .scroll_to,
         .set_text => .set_text,
         .set_selection => .set_selection,
         .select => .select,
