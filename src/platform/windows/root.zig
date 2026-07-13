@@ -33,6 +33,7 @@ const WindowsEventKind = enum(c_int) {
     timer = 16,
     appearance = 17,
     audio = 18,
+    widget_accessibility_action = 19,
 };
 
 const WindowsEvent = extern struct {
@@ -97,6 +98,59 @@ const WindowsEvent = extern struct {
     /// documented scale (log-spaced 50 Hz..16 kHz buckets, linear-in-dB
     /// from -60 dBFS at 0 to full scale at 255). Zeros elsewhere.
     audio_bands: [platform_mod.audio_spectrum_band_count]u8,
+    widget_id: u64,
+    widget_action: c_int,
+    widget_text: [*]const u8,
+    widget_text_len: usize,
+    has_widget_text_selection: c_int,
+    widget_text_selection_start: usize,
+    widget_text_selection_end: usize,
+};
+
+const WindowsWidgetAccessibilityNode = extern struct {
+    id: u64,
+    has_parent_id: c_int,
+    parent_id: u64,
+    role: c_int,
+    label: [*]const u8,
+    label_len: usize,
+    text_value: [*]const u8,
+    text_value_len: usize,
+    placeholder: [*]const u8,
+    placeholder_len: usize,
+    has_text_selection: c_int,
+    text_selection_start: usize,
+    text_selection_end: usize,
+    has_text_composition: c_int,
+    text_composition_start: usize,
+    text_composition_end: usize,
+    has_value: c_int,
+    value: f64,
+    has_grid_row_index: c_int,
+    grid_row_index: usize,
+    has_grid_column_index: c_int,
+    grid_column_index: usize,
+    has_grid_row_count: c_int,
+    grid_row_count: usize,
+    has_grid_column_count: c_int,
+    grid_column_count: usize,
+    has_list_item_index: c_int,
+    list_item_index: u32,
+    has_list_item_count: c_int,
+    list_item_count: u32,
+    has_scroll_offset: c_int,
+    scroll_offset: f64,
+    has_scroll_viewport_extent: c_int,
+    scroll_viewport_extent: f64,
+    has_scroll_content_extent: c_int,
+    scroll_content_extent: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    state_flags: u32,
+    action_flags: u32,
+    focusable: c_int,
 };
 
 const WindowsCallback = *const fn (context: ?*anyopaque, event: *const WindowsEvent) callconv(.c) void;
@@ -107,6 +161,27 @@ const shortcut_modifier_command: u32 = 1 << 1;
 const shortcut_modifier_control: u32 = 1 << 2;
 const shortcut_modifier_option: u32 = 1 << 3;
 const shortcut_modifier_shift: u32 = 1 << 4;
+const widget_state_enabled: u32 = 1 << 0;
+const widget_state_focused: u32 = 1 << 1;
+const widget_state_selected: u32 = 1 << 2;
+const widget_state_pressed: u32 = 1 << 3;
+const widget_state_expanded: u32 = 1 << 4;
+const widget_state_collapsed: u32 = 1 << 5;
+const widget_state_required: u32 = 1 << 6;
+const widget_state_read_only: u32 = 1 << 7;
+const widget_state_invalid: u32 = 1 << 8;
+const widget_state_hovered: u32 = 1 << 9;
+const widget_action_focus: u32 = 1 << 0;
+const widget_action_press: u32 = 1 << 1;
+const widget_action_toggle: u32 = 1 << 2;
+const widget_action_increment: u32 = 1 << 3;
+const widget_action_decrement: u32 = 1 << 4;
+const widget_action_set_text: u32 = 1 << 5;
+const widget_action_set_selection: u32 = 1 << 6;
+const widget_action_select: u32 = 1 << 7;
+const widget_action_drag: u32 = 1 << 8;
+const widget_action_drop_files: u32 = 1 << 9;
+const widget_action_dismiss: u32 = 1 << 10;
 
 extern fn native_sdk_windows_create(app_name: [*]const u8, app_name_len: usize, window_title: [*]const u8, window_title_len: usize, bundle_id: [*]const u8, bundle_id_len: usize, icon_path: [*]const u8, icon_path_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, min_width: f64, min_height: f64) ?*WindowsHost;
 extern fn native_sdk_windows_destroy(host: *WindowsHost) void;
@@ -143,6 +218,7 @@ extern fn native_sdk_windows_close_view(host: *WindowsHost, window_id: u64, labe
 extern fn native_sdk_windows_request_gpu_surface_frame(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize) c_int;
 extern fn native_sdk_windows_note_gpu_surface_input(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize) c_int;
 extern fn native_sdk_windows_present_gpu_surface_pixels(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, width: usize, height: usize, scale: f64, has_dirty_rect: c_int, dirty_x: f64, dirty_y: f64, dirty_width: f64, dirty_height: f64, rgba8: [*]const u8, rgba8_len: usize) c_int;
+extern fn native_sdk_windows_update_widget_accessibility(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, nodes: [*]const WindowsWidgetAccessibilityNode, node_count: usize) c_int;
 extern fn native_sdk_windows_create_webview(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, url: [*]const u8, url_len: usize, x: f64, y: f64, width: f64, height: f64, layer: c_int, transparent: c_int, bridge_enabled: c_int) c_int;
 extern fn native_sdk_windows_set_webview_frame(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, x: f64, y: f64, width: f64, height: f64) c_int;
 extern fn native_sdk_windows_navigate_webview(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, url: [*]const u8, url_len: usize) c_int;
@@ -297,6 +373,7 @@ pub const WindowsPlatform = struct {
                 .request_gpu_surface_frame_fn = requestGpuSurfaceFrame,
                 .note_gpu_surface_input_fn = noteGpuSurfaceInput,
                 .present_gpu_surface_pixels_fn = presentGpuSurfacePixels,
+                .update_widget_accessibility_fn = updateWidgetAccessibility,
                 .create_webview_fn = if (webviews_enabled) createWebView else null,
                 .set_webview_frame_fn = if (webviews_enabled) setWebViewFrame else null,
                 .navigate_webview_fn = if (webviews_enabled) navigateWebView else null,
@@ -543,7 +620,25 @@ fn windowsCallback(context: ?*anyopaque, event: *const WindowsEvent) callconv(.c
             .buffering = event.audio_buffering != 0,
             .bands = event.audio_bands,
         } }),
+        .widget_accessibility_action => if (widgetAccessibilityActionFromWindowsEvent(event)) |action| {
+            state.emit(.{ .widget_accessibility_action = action });
+        },
     }
+}
+
+fn widgetAccessibilityActionFromWindowsEvent(event: *const WindowsEvent) ?platform_mod.WidgetAccessibilityActionEvent {
+    const action = std.enums.fromInt(platform_mod.WidgetAccessibilityActionKind, event.widget_action) orelse return null;
+    return .{
+        .window_id = event.window_id,
+        .label = event.view_label[0..event.view_label_len],
+        .id = event.widget_id,
+        .action = action,
+        .text = event.widget_text[0..event.widget_text_len],
+        .selection = if (event.has_widget_text_selection != 0) .{
+            .start = event.widget_text_selection_start,
+            .end = event.widget_text_selection_end,
+        } else null,
+    };
 }
 
 /// Ordinals match the audio report kinds in webview2_host.cpp (the same
@@ -953,6 +1048,95 @@ fn presentGpuSurfacePixels(context: ?*anyopaque, pixels: platform_mod.GpuSurface
         pixels.rgba8.ptr,
         pixels.rgba8.len,
     ) == 0) return error.ViewNotFound;
+}
+
+fn updateWidgetAccessibility(context: ?*anyopaque, snapshot: platform_mod.WidgetAccessibilitySnapshot) anyerror!void {
+    const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine != .system) return error.UnsupportedViewKind;
+    if (snapshot.nodes.len > platform_mod.max_widget_accessibility_nodes) return error.InvalidViewOptions;
+    var nodes: [platform_mod.max_widget_accessibility_nodes]WindowsWidgetAccessibilityNode = undefined;
+    for (snapshot.nodes, 0..) |node, index| {
+        nodes[index] = windowsWidgetAccessibilityNodeFromPlatform(node);
+    }
+    if (native_sdk_windows_update_widget_accessibility(self.host, snapshot.window_id, snapshot.view_label.ptr, snapshot.view_label.len, nodes[0..snapshot.nodes.len].ptr, snapshot.nodes.len) == 0) return error.ViewNotFound;
+}
+
+fn windowsWidgetAccessibilityNodeFromPlatform(node: platform_mod.WidgetAccessibilityNode) WindowsWidgetAccessibilityNode {
+    return .{
+        .id = node.id,
+        .has_parent_id = if (node.parent_id != null) 1 else 0,
+        .parent_id = node.parent_id orelse 0,
+        .role = @intFromEnum(node.role),
+        .label = node.label.ptr,
+        .label_len = node.label.len,
+        .text_value = node.text_value.ptr,
+        .text_value_len = node.text_value.len,
+        .placeholder = node.placeholder.ptr,
+        .placeholder_len = node.placeholder.len,
+        .has_text_selection = if (node.text_selection != null) 1 else 0,
+        .text_selection_start = if (node.text_selection) |range| range.start else 0,
+        .text_selection_end = if (node.text_selection) |range| range.end else 0,
+        .has_text_composition = if (node.text_composition != null) 1 else 0,
+        .text_composition_start = if (node.text_composition) |range| range.start else 0,
+        .text_composition_end = if (node.text_composition) |range| range.end else 0,
+        .has_value = if (node.value != null) 1 else 0,
+        .value = node.value orelse 0,
+        .has_grid_row_index = if (node.grid_row_index != null) 1 else 0,
+        .grid_row_index = node.grid_row_index orelse 0,
+        .has_grid_column_index = if (node.grid_column_index != null) 1 else 0,
+        .grid_column_index = node.grid_column_index orelse 0,
+        .has_grid_row_count = if (node.grid_row_count != null) 1 else 0,
+        .grid_row_count = node.grid_row_count orelse 0,
+        .has_grid_column_count = if (node.grid_column_count != null) 1 else 0,
+        .grid_column_count = node.grid_column_count orelse 0,
+        .has_list_item_index = if (node.list_item_index != null) 1 else 0,
+        .list_item_index = node.list_item_index orelse 0,
+        .has_list_item_count = if (node.list_item_count != null) 1 else 0,
+        .list_item_count = node.list_item_count orelse 0,
+        .has_scroll_offset = if (node.scroll_offset != null) 1 else 0,
+        .scroll_offset = node.scroll_offset orelse 0,
+        .has_scroll_viewport_extent = if (node.scroll_viewport_extent != null) 1 else 0,
+        .scroll_viewport_extent = node.scroll_viewport_extent orelse 0,
+        .has_scroll_content_extent = if (node.scroll_content_extent != null) 1 else 0,
+        .scroll_content_extent = node.scroll_content_extent orelse 0,
+        .x = node.bounds.x,
+        .y = node.bounds.y,
+        .width = node.bounds.width,
+        .height = node.bounds.height,
+        .state_flags = widgetStateFlags(node),
+        .action_flags = widgetActionFlags(node.actions),
+        .focusable = if (node.focusable) 1 else 0,
+    };
+}
+
+fn widgetStateFlags(node: platform_mod.WidgetAccessibilityNode) u32 {
+    var flags: u32 = 0;
+    if (node.enabled) flags |= widget_state_enabled;
+    if (node.focused) flags |= widget_state_focused;
+    if (node.selected) flags |= widget_state_selected;
+    if (node.pressed) flags |= widget_state_pressed;
+    if (node.expanded) |expanded| flags |= if (expanded) widget_state_expanded else widget_state_collapsed;
+    if (node.required) flags |= widget_state_required;
+    if (node.read_only) flags |= widget_state_read_only;
+    if (node.invalid) flags |= widget_state_invalid;
+    if (node.hovered) flags |= widget_state_hovered;
+    return flags;
+}
+
+fn widgetActionFlags(actions: platform_mod.WidgetAccessibilityActions) u32 {
+    var flags: u32 = 0;
+    if (actions.focus) flags |= widget_action_focus;
+    if (actions.press) flags |= widget_action_press;
+    if (actions.toggle) flags |= widget_action_toggle;
+    if (actions.increment) flags |= widget_action_increment;
+    if (actions.decrement) flags |= widget_action_decrement;
+    if (actions.set_text) flags |= widget_action_set_text;
+    if (actions.set_selection) flags |= widget_action_set_selection;
+    if (actions.select) flags |= widget_action_select;
+    if (actions.drag) flags |= widget_action_drag;
+    if (actions.drop_files) flags |= widget_action_drop_files;
+    if (actions.dismiss) flags |= widget_action_dismiss;
+    return flags;
 }
 
 fn createWebView(context: ?*anyopaque, options: platform_mod.WebViewOptions) anyerror!void {
@@ -1415,6 +1599,122 @@ test "windows gpu surface input maps pointer cancel" {
     var event = std.mem.zeroes(WindowsEvent);
     event.input_kind = 11;
     try std.testing.expectEqual(platform_mod.GpuSurfaceInputKind.pointer_cancel, gpuSurfaceInputEventFromWindowsEvent(&event).kind);
+}
+
+test "windows widget accessibility action preserves typed payload" {
+    const label = "canvas";
+    const text = "updated";
+    var event = std.mem.zeroes(WindowsEvent);
+    event.window_id = 7;
+    event.view_label = label.ptr;
+    event.view_label_len = label.len;
+    event.widget_id = 42;
+    event.widget_action = 5;
+    event.widget_text = text.ptr;
+    event.widget_text_len = text.len;
+
+    const action = widgetAccessibilityActionFromWindowsEvent(&event).?;
+    try std.testing.expectEqual(@as(platform_mod.WindowId, 7), action.window_id);
+    try std.testing.expectEqualStrings("canvas", action.label);
+    try std.testing.expectEqual(@as(u64, 42), action.id);
+    try std.testing.expectEqual(platform_mod.WidgetAccessibilityActionKind.set_text, action.action);
+    try std.testing.expectEqualStrings("updated", action.text);
+
+    event.widget_action = 11;
+    event.widget_text = "0.73";
+    event.widget_text_len = 4;
+    const value_action = widgetAccessibilityActionFromWindowsEvent(&event).?;
+    try std.testing.expectEqual(platform_mod.WidgetAccessibilityActionKind.set_value, value_action.action);
+    try std.testing.expectEqualStrings("0.73", value_action.text);
+}
+
+test "windows widget accessibility ABI preserves canonical node" {
+    const source: platform_mod.WidgetAccessibilityNode = .{
+        .id = 42,
+        .parent_id = 7,
+        .role = .gridcell,
+        .label = "Lesson 42",
+        .text_value = "résumé",
+        .placeholder = "Open lesson",
+        .text_selection = .{ .start = 1, .end = 5 },
+        .text_composition = .{ .start = 2, .end = 4 },
+        .value = 0.75,
+        .bounds = geometry.RectF.init(12, 24, 180, 36),
+        .grid_row_index = 4,
+        .grid_column_index = 2,
+        .grid_row_count = 100,
+        .grid_column_count = 3,
+        .list_item_index = 41,
+        .list_item_count = 1_000,
+        .scroll_offset = 320,
+        .scroll_viewport_extent = 640,
+        .scroll_content_extent = 32_000,
+        .enabled = true,
+        .focused = true,
+        .hovered = true,
+        .pressed = true,
+        .selected = true,
+        .expanded = false,
+        .required = true,
+        .read_only = true,
+        .invalid = true,
+        .focusable = true,
+        .actions = .{
+            .focus = true,
+            .press = true,
+            .toggle = true,
+            .increment = true,
+            .decrement = true,
+            .set_text = true,
+            .set_selection = true,
+            .select = true,
+            .drag = true,
+            .drop_files = true,
+            .dismiss = true,
+        },
+    };
+
+    const node = windowsWidgetAccessibilityNodeFromPlatform(source);
+    try std.testing.expectEqual(@as(u64, 42), node.id);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_parent_id);
+    try std.testing.expectEqual(@as(u64, 7), node.parent_id);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(platform_mod.WidgetAccessibilityRole.gridcell)), node.role);
+    try std.testing.expectEqualStrings("Lesson 42", node.label[0..node.label_len]);
+    try std.testing.expectEqualStrings("résumé", node.text_value[0..node.text_value_len]);
+    try std.testing.expectEqualStrings("Open lesson", node.placeholder[0..node.placeholder_len]);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_text_selection);
+    try std.testing.expectEqual(@as(usize, 1), node.text_selection_start);
+    try std.testing.expectEqual(@as(usize, 5), node.text_selection_end);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_text_composition);
+    try std.testing.expectEqual(@as(usize, 2), node.text_composition_start);
+    try std.testing.expectEqual(@as(usize, 4), node.text_composition_end);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_value);
+    try std.testing.expectEqual(@as(f64, 0.75), node.value);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_grid_row_index);
+    try std.testing.expectEqual(@as(usize, 4), node.grid_row_index);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_grid_column_index);
+    try std.testing.expectEqual(@as(usize, 2), node.grid_column_index);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_grid_row_count);
+    try std.testing.expectEqual(@as(usize, 100), node.grid_row_count);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_grid_column_count);
+    try std.testing.expectEqual(@as(usize, 3), node.grid_column_count);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_list_item_index);
+    try std.testing.expectEqual(@as(u32, 41), node.list_item_index);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_list_item_count);
+    try std.testing.expectEqual(@as(u32, 1_000), node.list_item_count);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_scroll_offset);
+    try std.testing.expectEqual(@as(f64, 320), node.scroll_offset);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_scroll_viewport_extent);
+    try std.testing.expectEqual(@as(f64, 640), node.scroll_viewport_extent);
+    try std.testing.expectEqual(@as(c_int, 1), node.has_scroll_content_extent);
+    try std.testing.expectEqual(@as(f64, 32_000), node.scroll_content_extent);
+    try std.testing.expectEqual(@as(f64, 12), node.x);
+    try std.testing.expectEqual(@as(f64, 24), node.y);
+    try std.testing.expectEqual(@as(f64, 180), node.width);
+    try std.testing.expectEqual(@as(f64, 36), node.height);
+    try std.testing.expectEqual(@as(u32, 0x3ef), node.state_flags);
+    try std.testing.expectEqual(@as(u32, 0x7ff), node.action_flags);
+    try std.testing.expectEqual(@as(c_int, 1), node.focusable);
 }
 
 test "windows gpu surface input maps ime text and composition events" {
