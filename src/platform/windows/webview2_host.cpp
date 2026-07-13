@@ -205,7 +205,11 @@ enum WidgetAccessibilityActionKind {
     kWidgetAccessibilitySetSelection = 6,
     kWidgetAccessibilitySelect = 7,
     kWidgetAccessibilitySetValue = 11,
+    kWidgetAccessibilityScrollBy = 12,
+    kWidgetAccessibilityScrollTo = 13,
 };
+
+static constexpr double kUiaScrollNoScroll = -1.0;
 
 struct WindowsWidgetAccessibilityNode {
     uint64_t id;
@@ -909,6 +913,8 @@ static PATTERNID widgetAccessibilityPatternForAvailabilityProperty(PROPERTYID pr
         case UIA_IsGridItemPatternAvailablePropertyId: return UIA_GridItemPatternId;
         case UIA_IsTextPatternAvailablePropertyId: return UIA_TextPatternId;
         case UIA_IsTextEditPatternAvailablePropertyId: return UIA_TextEditPatternId;
+        case UIA_IsScrollPatternAvailablePropertyId: return UIA_ScrollPatternId;
+        case UIA_IsScrollItemPatternAvailablePropertyId: return UIA_ScrollItemPatternId;
         default: return 0;
     }
 }
@@ -950,6 +956,13 @@ static bool validWidgetAccessibilityTree(const WindowsWidgetAccessibilityNode *n
             (node.has_grid_column_index && node.grid_column_index > INT_MAX) ||
             (node.has_grid_row_count && node.grid_row_count > INT_MAX) ||
             (node.has_grid_column_count && node.grid_column_count > INT_MAX)) return false;
+        const bool has_any_scroll = node.has_scroll_offset || node.has_scroll_viewport_extent || node.has_scroll_content_extent;
+        const bool has_all_scroll = node.has_scroll_offset && node.has_scroll_viewport_extent && node.has_scroll_content_extent;
+        if (has_any_scroll && (!has_all_scroll ||
+            !std::isfinite(node.scroll_offset) || !std::isfinite(node.scroll_viewport_extent) ||
+            !std::isfinite(node.scroll_content_extent) || node.scroll_offset < 0 ||
+            node.scroll_viewport_extent < 0 || node.scroll_content_extent < 0 ||
+            node.scroll_offset > std::max(0.0, node.scroll_content_extent - node.scroll_viewport_extent) + 0.5)) return false;
         for (size_t duplicate = index + 1; duplicate < count; ++duplicate) {
             if (nodes[duplicate].id == node.id) return false;
         }
@@ -1692,6 +1705,8 @@ class WidgetAccessibilityProvider final : public IRawElementProviderSimple,
                                           public IExpandCollapseProvider,
                                           public IGridProvider,
                                           public IGridItemProvider,
+                                          public IScrollProvider,
+                                          public IScrollItemProvider,
                                           public ITextEditProvider {
 public:
     WidgetAccessibilityProvider(std::shared_ptr<WidgetAccessibilityTreeState> state, uint64_t id, uint64_t incarnation)
@@ -1711,6 +1726,8 @@ public:
         else if (IsEqualIID(iid, IID_IExpandCollapseProvider)) *object = static_cast<IExpandCollapseProvider *>(this);
         else if (IsEqualIID(iid, IID_IGridProvider)) *object = static_cast<IGridProvider *>(this);
         else if (IsEqualIID(iid, IID_IGridItemProvider)) *object = static_cast<IGridItemProvider *>(this);
+        else if (IsEqualIID(iid, IID_IScrollProvider)) *object = static_cast<IScrollProvider *>(this);
+        else if (IsEqualIID(iid, IID_IScrollItemProvider)) *object = static_cast<IScrollItemProvider *>(this);
         else if (IsEqualIID(iid, IID_ITextProvider)) *object = static_cast<ITextProvider *>(this);
         else if (IsEqualIID(iid, IID_ITextEditProvider)) *object = static_cast<ITextEditProvider *>(this);
         else return E_NOINTERFACE;
@@ -1746,6 +1763,13 @@ public:
         if (pattern == UIA_ExpandCollapsePatternId && (node.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed)) && (node.action_flags & kWidgetActionToggle)) return QueryInterface(IID_IExpandCollapseProvider, reinterpret_cast<void **>(value));
         if (pattern == UIA_GridPatternId && node.has_grid_row_count && node.has_grid_column_count) return QueryInterface(IID_IGridProvider, reinterpret_cast<void **>(value));
         if (pattern == UIA_GridItemPatternId && node.has_grid_row_index && node.has_grid_column_index) return QueryInterface(IID_IGridItemProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_ScrollPatternId && hasScrollMetrics(node) &&
+            (node.action_flags & kWidgetActionIncrement) && (node.action_flags & kWidgetActionDecrement)) {
+            return QueryInterface(IID_IScrollProvider, reinterpret_cast<void **>(value));
+        }
+        if (pattern == UIA_ScrollItemPatternId && hasScrollableAncestor()) {
+            return QueryInterface(IID_IScrollItemProvider, reinterpret_cast<void **>(value));
+        }
         if (pattern == UIA_TextPatternId && node.role == 5) return QueryInterface(IID_ITextProvider, reinterpret_cast<void **>(value));
         if (pattern == UIA_TextEditPatternId && node.role == 5) return QueryInterface(IID_ITextEditProvider, reinterpret_cast<void **>(value));
         return S_OK;
@@ -2087,6 +2111,120 @@ public:
     HRESULT STDMETHODCALLTYPE get_ColumnSpan(int *value) override { if (!value) return E_INVALIDARG; WidgetAccessibilityNodeState node; if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE; *value = 1; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_ContainingGrid(IRawElementProviderSimple **value) override;
 
+    HRESULT STDMETHODCALLTYPE Scroll(enum ScrollAmount horizontal, enum ScrollAmount vertical) override {
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!hasScrollMetrics(node) || !(node.action_flags & kWidgetActionIncrement) ||
+            !(node.action_flags & kWidgetActionDecrement)) return UIA_E_INVALIDOPERATION;
+        if (horizontal != ScrollAmount_NoAmount) return E_INVALIDARG;
+        if (vertical == ScrollAmount_NoAmount) return S_OK;
+        double fraction = 0;
+        uint32_t required_flag = 0;
+        switch (vertical) {
+            case ScrollAmount_SmallDecrement: fraction = -0.35; required_flag = kWidgetActionDecrement; break;
+            case ScrollAmount_LargeDecrement: fraction = -0.85; required_flag = kWidgetActionDecrement; break;
+            case ScrollAmount_SmallIncrement: fraction = 0.35; required_flag = kWidgetActionIncrement; break;
+            case ScrollAmount_LargeIncrement: fraction = 0.85; required_flag = kWidgetActionIncrement; break;
+            default: return E_INVALIDARG;
+        }
+        if (scrollMaximum(node) <= 0) return UIA_E_INVALIDOPERATION;
+        return postNumericAction(kWidgetAccessibilityScrollBy, required_flag, fraction);
+    }
+
+    HRESULT STDMETHODCALLTYPE SetScrollPercent(double horizontal, double vertical) override {
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!hasScrollMetrics(node) || !(node.action_flags & kWidgetActionIncrement) ||
+            !(node.action_flags & kWidgetActionDecrement)) return UIA_E_INVALIDOPERATION;
+        if (!std::isfinite(horizontal) || !std::isfinite(vertical) ||
+            horizontal != kUiaScrollNoScroll) return E_INVALIDARG;
+        if (vertical == kUiaScrollNoScroll) return S_OK;
+        if (vertical < 0 || vertical > 100) return E_INVALIDARG;
+        if (scrollMaximum(node) <= 0) return UIA_E_INVALIDOPERATION;
+        return postNumericAction(
+            kWidgetAccessibilityScrollTo,
+            kWidgetActionIncrement | kWidgetActionDecrement,
+            vertical / 100.0
+        );
+    }
+
+    HRESULT STDMETHODCALLTYPE get_HorizontalScrollPercent(double *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!hasScrollMetrics(node)) return UIA_E_INVALIDOPERATION;
+        *value = kUiaScrollNoScroll;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_HorizontalViewSize(double *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!hasScrollMetrics(node)) return UIA_E_INVALIDOPERATION;
+        *value = 100;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_HorizontallyScrollable(WINBOOL *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!hasScrollMetrics(node)) return UIA_E_INVALIDOPERATION;
+        *value = FALSE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_VerticalScrollPercent(double *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!hasScrollMetrics(node)) return UIA_E_INVALIDOPERATION;
+        const double maximum = scrollMaximum(node);
+        *value = maximum > 0
+            ? std::clamp(node.scroll_offset / maximum * 100.0, 0.0, 100.0)
+            : kUiaScrollNoScroll;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_VerticalViewSize(double *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!hasScrollMetrics(node)) return UIA_E_INVALIDOPERATION;
+        *value = node.scroll_content_extent > 0
+            ? std::clamp(node.scroll_viewport_extent / node.scroll_content_extent * 100.0, 0.0, 100.0)
+            : 100.0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_VerticallyScrollable(WINBOOL *value) override {
+        if (!value) return E_INVALIDARG;
+        WidgetAccessibilityNodeState node;
+        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
+        if (!hasScrollMetrics(node)) return UIA_E_INVALIDOPERATION;
+        *value = scrollMaximum(node) > 0 ? TRUE : FALSE;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE ScrollIntoView() override {
+        WidgetAccessibilityNodeState node;
+        WidgetAccessibilityNodeState container;
+        if (!scrollContainerValues(&node, &container)) return UIA_E_INVALIDOPERATION;
+        const double maximum = scrollMaximum(container);
+        if (maximum <= 0) return S_OK;
+        const double logical_top = node.y - container.y + container.scroll_offset;
+        const double logical_bottom = logical_top + node.height;
+        double target = container.scroll_offset;
+        if (logical_top < container.scroll_offset) target = logical_top;
+        else if (logical_bottom > container.scroll_offset + container.scroll_viewport_extent) {
+            target = logical_bottom - container.scroll_viewport_extent;
+        } else return S_OK;
+        target = std::clamp(target, 0.0, maximum);
+        return postWidgetAccessibilityNumericAction(
+            container.id,
+            container.incarnation,
+            kWidgetAccessibilityScrollTo,
+            kWidgetActionIncrement | kWidgetActionDecrement,
+            target / maximum
+        );
+    }
+
     HRESULT STDMETHODCALLTYPE GetSelection(SAFEARRAY **value) override;
     HRESULT STDMETHODCALLTYPE GetVisibleRanges(SAFEARRAY **value) override {
         if (!value) return E_INVALIDARG;
@@ -2171,6 +2309,72 @@ public:
     uint64_t id() const { return id_; }
 
 private:
+    static bool hasScrollMetrics(const WidgetAccessibilityNodeState &node) {
+        return node.has_scroll_offset && node.has_scroll_viewport_extent && node.has_scroll_content_extent;
+    }
+
+    static double scrollMaximum(const WidgetAccessibilityNodeState &node) {
+        return std::max(0.0, node.scroll_content_extent - node.scroll_viewport_extent);
+    }
+
+    bool scrollContainerValues(
+        WidgetAccessibilityNodeState *node_value,
+        WidgetAccessibilityNodeState *container_value
+    ) const {
+        if (!node_value || !container_value || !state_) return false;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return false;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return false;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (!state_->root || !state_->host || !state_->hwnd) return false;
+        auto found = state_->nodes.find(id_);
+        if (found == state_->nodes.end() || found->second.incarnation != incarnation_) return false;
+        *node_value = found->second;
+        uint64_t parent_id = found->second.parent_id;
+        bool has_parent = found->second.has_parent_id;
+        size_t remaining = state_->nodes.size();
+        while (has_parent && remaining-- > 0) {
+            auto parent = state_->nodes.find(parent_id);
+            if (parent == state_->nodes.end()) return false;
+            if (hasScrollMetrics(parent->second) &&
+                (parent->second.action_flags & kWidgetActionIncrement) &&
+                (parent->second.action_flags & kWidgetActionDecrement)) {
+                *container_value = parent->second;
+                return true;
+            }
+            parent_id = parent->second.parent_id;
+            has_parent = parent->second.has_parent_id;
+        }
+        return false;
+    }
+
+    bool hasScrollableAncestor() const {
+        WidgetAccessibilityNodeState node;
+        WidgetAccessibilityNodeState container;
+        return scrollContainerValues(&node, &container);
+    }
+
+    HRESULT postWidgetAccessibilityNumericAction(
+        uint64_t id,
+        uint64_t incarnation,
+        int action,
+        uint32_t required_flag,
+        double value
+    ) {
+        char text[64];
+        const int text_len = snprintf(text, sizeof(text), "%.17g", value);
+        if (text_len <= 0 || (size_t)text_len >= sizeof(text)) return E_FAIL;
+        std::replace(text, text + text_len, ',', '.');
+        return postWidgetAccessibilityAction(
+            state_, id, incarnation, action, required_flag, std::string(text, (size_t)text_len)
+        );
+    }
+
+    HRESULT postNumericAction(int action, uint32_t required_flag, double value) {
+        return postWidgetAccessibilityNumericAction(id_, incarnation_, action, required_flag, value);
+    }
+
     bool nodeValue(WidgetAccessibilityNodeState *value) const {
         if (!value || !state_) return false;
         std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
