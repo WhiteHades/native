@@ -26,6 +26,7 @@
 #include <mutex>
 #include <new>
 #include <limits>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -553,6 +554,8 @@ struct WidgetAccessibilityNodeState {
     bool focusable = false;
 };
 
+using WidgetAccessibilityNodeMap = std::map<uint64_t, WidgetAccessibilityNodeState>;
+
 struct WidgetAccessibilityTreeState {
     std::recursive_mutex mutex;
     Host *host = nullptr;
@@ -561,7 +564,7 @@ struct WidgetAccessibilityTreeState {
     uint64_t window_id = 0;
     std::string view_label;
     std::vector<uint64_t> order;
-    std::map<uint64_t, WidgetAccessibilityNodeState> nodes;
+    WidgetAccessibilityNodeMap nodes;
     WidgetAccessibilityRootProvider *root = nullptr;
 };
 
@@ -919,6 +922,99 @@ static PATTERNID widgetAccessibilityPatternForAvailabilityProperty(PROPERTYID pr
     }
 }
 
+static bool widgetAccessibilityHasScrollMetrics(const WidgetAccessibilityNodeState &node) {
+    return node.has_scroll_offset && node.has_scroll_viewport_extent && node.has_scroll_content_extent;
+}
+
+static double widgetAccessibilityScrollMaximum(const WidgetAccessibilityNodeState &node) {
+    return std::max(0.0, node.scroll_content_extent - node.scroll_viewport_extent);
+}
+
+static bool widgetAccessibilityHasSelectionChild(
+    uint64_t id,
+    const WidgetAccessibilityNodeMap &nodes
+) {
+    for (const auto &entry : nodes) {
+        if (entry.second.has_parent_id && entry.second.parent_id == id &&
+            (entry.second.action_flags & kWidgetActionSelect)) return true;
+    }
+    return false;
+}
+
+static bool widgetAccessibilityHasScrollableAncestor(
+    const WidgetAccessibilityNodeState &node,
+    const WidgetAccessibilityNodeMap &nodes
+) {
+    uint64_t parent_id = node.parent_id;
+    bool has_parent = node.has_parent_id;
+    size_t remaining = nodes.size();
+    while (has_parent && remaining-- > 0) {
+        auto parent = nodes.find(parent_id);
+        if (parent == nodes.end()) return false;
+        if (widgetAccessibilityHasScrollMetrics(parent->second) &&
+            (parent->second.action_flags & kWidgetActionIncrement) &&
+            (parent->second.action_flags & kWidgetActionDecrement)) return true;
+        parent_id = parent->second.parent_id;
+        has_parent = parent->second.has_parent_id;
+    }
+    return false;
+}
+
+static bool widgetAccessibilityPatternAvailable(
+    PATTERNID pattern,
+    const WidgetAccessibilityNodeState &node,
+    const WidgetAccessibilityNodeMap &nodes
+) {
+    if (pattern == UIA_InvokePatternId) return (node.action_flags & kWidgetActionPress) != 0;
+    if (pattern == UIA_ValuePatternId) return node.role == 5 || (node.action_flags & kWidgetActionSetText);
+    if (pattern == UIA_RangeValuePatternId) return node.has_value && (node.role == 18 || node.role == 19);
+    if (pattern == UIA_TogglePatternId) {
+        return (node.action_flags & kWidgetActionToggle) &&
+            !(node.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed));
+    }
+    if (pattern == UIA_SelectionPatternId) return widgetAccessibilityHasSelectionChild(node.id, nodes);
+    if (pattern == UIA_SelectionItemPatternId) return (node.action_flags & kWidgetActionSelect) != 0;
+    if (pattern == UIA_ExpandCollapsePatternId) {
+        return (node.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed)) &&
+            (node.action_flags & kWidgetActionToggle);
+    }
+    if (pattern == UIA_GridPatternId) return node.has_grid_row_count && node.has_grid_column_count;
+    if (pattern == UIA_GridItemPatternId) return node.has_grid_row_index && node.has_grid_column_index;
+    if (pattern == UIA_TextPatternId || pattern == UIA_TextEditPatternId) return node.role == 5;
+    if (pattern == UIA_ScrollPatternId) {
+        return widgetAccessibilityHasScrollMetrics(node) &&
+            (node.action_flags & kWidgetActionIncrement) &&
+            (node.action_flags & kWidgetActionDecrement);
+    }
+    if (pattern == UIA_ScrollItemPatternId) return widgetAccessibilityHasScrollableAncestor(node, nodes);
+    return false;
+}
+
+struct WidgetAccessibilityScrollProperties {
+    double horizontal_percent = kUiaScrollNoScroll;
+    double horizontal_view_size = 100;
+    bool horizontally_scrollable = false;
+    double vertical_percent = kUiaScrollNoScroll;
+    double vertical_view_size = 100;
+    bool vertically_scrollable = false;
+};
+
+static WidgetAccessibilityScrollProperties widgetAccessibilityScrollProperties(
+    const WidgetAccessibilityNodeState &node
+) {
+    WidgetAccessibilityScrollProperties properties;
+    if (!widgetAccessibilityHasScrollMetrics(node)) return properties;
+    const double maximum = widgetAccessibilityScrollMaximum(node);
+    properties.vertical_percent = maximum > 0
+        ? std::clamp(node.scroll_offset / maximum * 100.0, 0.0, 100.0)
+        : kUiaScrollNoScroll;
+    properties.vertical_view_size = node.scroll_content_extent > 0
+        ? std::clamp(node.scroll_viewport_extent / node.scroll_content_extent * 100.0, 0.0, 100.0)
+        : 100.0;
+    properties.vertically_scrollable = maximum > 0;
+    return properties;
+}
+
 static HRESULT widgetAccessibilityNotSupported(VARIANT *value) {
     if (!value) return E_INVALIDARG;
     value->vt = VT_UNKNOWN;
@@ -1003,8 +1099,9 @@ static bool widgetAccessibilityRectEmpty(const WidgetAccessibilityRect &value) {
     return value.right <= value.left || value.bottom <= value.top;
 }
 
-static bool widgetAccessibilityVisibleRectLocked(
+static bool widgetAccessibilityVisibleRectForNodesLocked(
     const WidgetAccessibilityTreeState &state,
+    const WidgetAccessibilityNodeMap &nodes,
     const WidgetAccessibilityNodeState &node,
     WidgetAccessibilityRect *value,
     bool *offscreen,
@@ -1026,10 +1123,10 @@ static bool widgetAccessibilityVisibleRectLocked(
     });
     uint64_t parent_id = node.parent_id;
     bool has_parent = node.has_parent_id;
-    size_t remaining = state.nodes.size();
+    size_t remaining = nodes.size();
     while (has_parent && remaining-- > 0) {
-        auto parent = state.nodes.find(parent_id);
-        if (parent == state.nodes.end()) break;
+        auto parent = nodes.find(parent_id);
+        if (parent == nodes.end()) break;
         const WidgetAccessibilityNodeState &ancestor = parent->second;
         if (ancestor.has_scroll_offset || ancestor.has_scroll_viewport_extent || ancestor.has_scroll_content_extent) {
             widgetAccessibilityIntersectRect(&clipped, {
@@ -1047,6 +1144,37 @@ static bool widgetAccessibilityVisibleRectLocked(
     if (screen_origin) *screen_origin = origin;
     if (scale_value) *scale_value = scale;
     return true;
+}
+
+static bool widgetAccessibilityVisibleRectLocked(
+    const WidgetAccessibilityTreeState &state,
+    const WidgetAccessibilityNodeState &node,
+    WidgetAccessibilityRect *value,
+    bool *offscreen,
+    POINT *screen_origin,
+    double *scale_value
+) {
+    return widgetAccessibilityVisibleRectForNodesLocked(
+        state, state.nodes, node, value, offscreen, screen_origin, scale_value
+    );
+}
+
+static struct UiaRect widgetAccessibilityScreenRect(
+    const WidgetAccessibilityRect &rect,
+    const POINT &origin,
+    double scale
+) {
+    struct UiaRect value = {};
+    value.left = origin.x + rect.left * scale;
+    value.top = origin.y + rect.top * scale;
+    value.width = (rect.right - rect.left) * scale;
+    value.height = (rect.bottom - rect.top) * scale;
+    return value;
+}
+
+static bool widgetAccessibilitySameRect(const struct UiaRect &left, const struct UiaRect &right) {
+    return left.left == right.left && left.top == right.top &&
+        left.width == right.width && left.height == right.height;
 }
 
 static HRESULT postWidgetAccessibilityAction(
@@ -1751,27 +1879,20 @@ public:
     HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID pattern, IUnknown **value) override {
         if (!value) return E_INVALIDARG;
         *value = nullptr;
-        WidgetAccessibilityNodeState node;
-        if (!nodeValue(&node)) return UIA_E_ELEMENTNOTAVAILABLE;
-        if (pattern == UIA_InvokePatternId && (node.action_flags & kWidgetActionPress)) return QueryInterface(IID_IInvokeProvider, reinterpret_cast<void **>(value));
-        if (pattern == UIA_ValuePatternId && (node.role == 5 || (node.action_flags & kWidgetActionSetText))) return QueryInterface(IID_IValueProvider, reinterpret_cast<void **>(value));
-        if (pattern == UIA_RangeValuePatternId && node.has_value && (node.role == 18 || node.role == 19)) return QueryInterface(IID_IRangeValueProvider, reinterpret_cast<void **>(value));
-        if (pattern == UIA_TogglePatternId && (node.action_flags & kWidgetActionToggle) &&
-            !(node.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed))) return QueryInterface(IID_IToggleProvider, reinterpret_cast<void **>(value));
-        if (pattern == UIA_SelectionPatternId && isSelectionContainer()) return QueryInterface(IID_ISelectionProvider, reinterpret_cast<void **>(value));
-        if (pattern == UIA_SelectionItemPatternId && (node.action_flags & kWidgetActionSelect)) return QueryInterface(IID_ISelectionItemProvider, reinterpret_cast<void **>(value));
-        if (pattern == UIA_ExpandCollapsePatternId && (node.state_flags & (kWidgetStateExpanded | kWidgetStateCollapsed)) && (node.action_flags & kWidgetActionToggle)) return QueryInterface(IID_IExpandCollapseProvider, reinterpret_cast<void **>(value));
-        if (pattern == UIA_GridPatternId && node.has_grid_row_count && node.has_grid_column_count) return QueryInterface(IID_IGridProvider, reinterpret_cast<void **>(value));
-        if (pattern == UIA_GridItemPatternId && node.has_grid_row_index && node.has_grid_column_index) return QueryInterface(IID_IGridItemProvider, reinterpret_cast<void **>(value));
-        if (pattern == UIA_ScrollPatternId && hasScrollMetrics(node) &&
-            (node.action_flags & kWidgetActionIncrement) && (node.action_flags & kWidgetActionDecrement)) {
-            return QueryInterface(IID_IScrollProvider, reinterpret_cast<void **>(value));
-        }
-        if (pattern == UIA_ScrollItemPatternId && hasScrollableAncestor()) {
-            return QueryInterface(IID_IScrollItemProvider, reinterpret_cast<void **>(value));
-        }
-        if (pattern == UIA_TextPatternId && node.role == 5) return QueryInterface(IID_ITextProvider, reinterpret_cast<void **>(value));
-        if (pattern == UIA_TextEditPatternId && node.role == 5) return QueryInterface(IID_ITextEditProvider, reinterpret_cast<void **>(value));
+        if (!patternAvailable(pattern)) return nodeAvailable() ? S_OK : UIA_E_ELEMENTNOTAVAILABLE;
+        if (pattern == UIA_InvokePatternId) return QueryInterface(IID_IInvokeProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_ValuePatternId) return QueryInterface(IID_IValueProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_RangeValuePatternId) return QueryInterface(IID_IRangeValueProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_TogglePatternId) return QueryInterface(IID_IToggleProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_SelectionPatternId) return QueryInterface(IID_ISelectionProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_SelectionItemPatternId) return QueryInterface(IID_ISelectionItemProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_ExpandCollapsePatternId) return QueryInterface(IID_IExpandCollapseProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_GridPatternId) return QueryInterface(IID_IGridProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_GridItemPatternId) return QueryInterface(IID_IGridItemProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_ScrollPatternId) return QueryInterface(IID_IScrollProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_ScrollItemPatternId) return QueryInterface(IID_IScrollItemProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_TextPatternId) return QueryInterface(IID_ITextProvider, reinterpret_cast<void **>(value));
+        if (pattern == UIA_TextEditPatternId) return QueryInterface(IID_ITextEditProvider, reinterpret_cast<void **>(value));
         return S_OK;
     }
 
@@ -2309,12 +2430,30 @@ public:
     uint64_t id() const { return id_; }
 
 private:
+    bool nodeAvailable() const {
+        WidgetAccessibilityNodeState node;
+        return nodeValue(&node);
+    }
+
+    bool patternAvailable(PATTERNID pattern) const {
+        if (!state_) return false;
+        std::shared_ptr<HostLifetime> lifetime = state_->lifetime;
+        if (!lifetime) return false;
+        std::lock_guard<std::recursive_mutex> lifetime_guard(lifetime->mutex);
+        if (!lifetime->alive) return false;
+        std::lock_guard<std::recursive_mutex> guard(state_->mutex);
+        if (!state_->root || !state_->host || !state_->hwnd) return false;
+        auto found = state_->nodes.find(id_);
+        return found != state_->nodes.end() && found->second.incarnation == incarnation_ &&
+            widgetAccessibilityPatternAvailable(pattern, found->second, state_->nodes);
+    }
+
     static bool hasScrollMetrics(const WidgetAccessibilityNodeState &node) {
-        return node.has_scroll_offset && node.has_scroll_viewport_extent && node.has_scroll_content_extent;
+        return widgetAccessibilityHasScrollMetrics(node);
     }
 
     static double scrollMaximum(const WidgetAccessibilityNodeState &node) {
-        return std::max(0.0, node.scroll_content_extent - node.scroll_viewport_extent);
+        return widgetAccessibilityScrollMaximum(node);
     }
 
     bool scrollContainerValues(
@@ -2656,6 +2795,12 @@ public:
             WidgetAccessibilityProvider *provider = nullptr;
             WidgetAccessibilityNodeState before;
             WidgetAccessibilityNodeState after;
+            bool has_before_geometry = false;
+            bool has_after_geometry = false;
+            struct UiaRect before_bounds = {};
+            struct UiaRect after_bounds = {};
+            bool before_offscreen = true;
+            bool after_offscreen = true;
         };
         struct StructureDelta {
             IRawElementProviderSimple *sender = nullptr;
@@ -2664,14 +2809,17 @@ public:
         };
         std::vector<NodeDelta> deltas;
         std::vector<StructureDelta> structure_deltas;
+        std::vector<IRawElementProviderSimple *> layout_senders;
         std::vector<WidgetAccessibilityProvider *> removed_providers;
+        WidgetAccessibilityNodeMap previous;
+        std::vector<uint64_t> previous_order;
         bool structure_changed = false;
         Host *disconnect_host = nullptr;
         {
             std::lock_guard<std::recursive_mutex> guard(state_->mutex);
             disconnect_host = state_->host;
-            const std::map<uint64_t, WidgetAccessibilityNodeState> previous = state_->nodes;
-            const std::vector<uint64_t> previous_order = state_->order;
+            previous = state_->nodes;
+            previous_order = state_->order;
             for (auto &entry : next) {
                 auto old = previous.find(entry.first);
                 if (old != previous.end()) {
@@ -2736,7 +2884,31 @@ public:
                 auto provider = providers_.find(entry.first);
                 if (provider != providers_.end() && provider->second) {
                     provider->second->AddRef();
-                    deltas.push_back({ provider->second, old->second, entry.second });
+                    NodeDelta delta;
+                    delta.provider = provider->second;
+                    delta.before = old->second;
+                    delta.after = entry.second;
+                    WidgetAccessibilityRect before_rect;
+                    WidgetAccessibilityRect after_rect;
+                    POINT before_origin = {};
+                    POINT after_origin = {};
+                    double before_scale = 1;
+                    double after_scale = 1;
+                    delta.has_before_geometry = widgetAccessibilityVisibleRectForNodesLocked(
+                        *state_, previous, delta.before, &before_rect, &delta.before_offscreen,
+                        &before_origin, &before_scale
+                    );
+                    delta.has_after_geometry = widgetAccessibilityVisibleRectForNodesLocked(
+                        *state_, next, delta.after, &after_rect, &delta.after_offscreen,
+                        &after_origin, &after_scale
+                    );
+                    if (delta.has_before_geometry) {
+                        delta.before_bounds = widgetAccessibilityScreenRect(before_rect, before_origin, before_scale);
+                    }
+                    if (delta.has_after_geometry) {
+                        delta.after_bounds = widgetAccessibilityScreenRect(after_rect, after_origin, after_scale);
+                    }
+                    deltas.push_back(std::move(delta));
                 }
             }
             for (const auto &entry : previous) {
@@ -2776,6 +2948,28 @@ public:
             }
             state_->nodes = next;
             state_->order = order;
+            std::set<uint64_t> layout_ids;
+            for (const NodeDelta &delta : deltas) {
+                const bool bounds_changed = delta.has_before_geometry && delta.has_after_geometry &&
+                    !widgetAccessibilitySameRect(delta.before_bounds, delta.after_bounds);
+                if (bounds_changed && delta.after.has_parent_id && next.find(delta.after.parent_id) != next.end()) {
+                    layout_ids.insert(delta.after.parent_id);
+                }
+                const bool before_scroll = widgetAccessibilityPatternAvailable(UIA_ScrollPatternId, delta.before, previous);
+                const bool after_scroll = widgetAccessibilityPatternAvailable(UIA_ScrollPatternId, delta.after, next);
+                if (before_scroll && after_scroll) {
+                    const WidgetAccessibilityScrollProperties before = widgetAccessibilityScrollProperties(delta.before);
+                    const WidgetAccessibilityScrollProperties after = widgetAccessibilityScrollProperties(delta.after);
+                    if (before.vertical_percent != after.vertical_percent ||
+                        before.vertical_view_size != after.vertical_view_size ||
+                        before.vertically_scrollable != after.vertically_scrollable) {
+                        layout_ids.insert(delta.after.id);
+                    }
+                }
+            }
+            for (uint64_t id : layout_ids) {
+                if (IRawElementProviderSimple *sender = retainProvider(id)) layout_senders.push_back(sender);
+            }
         }
 
         auto raiseIntProperty = [](WidgetAccessibilityProvider *provider, PROPERTYID property, int before, int after) {
@@ -2824,6 +3018,75 @@ public:
             VariantClear(&old_value);
             VariantClear(&new_value);
         };
+        auto raiseOptionalIntProperty = [](WidgetAccessibilityProvider *provider, PROPERTYID property,
+                                           bool before_present, int before, bool after_present, int after) {
+            VARIANT old_value;
+            VARIANT new_value;
+            VariantInit(&old_value);
+            VariantInit(&new_value);
+            if (before_present) {
+                old_value.vt = VT_I4;
+                old_value.lVal = before;
+            } else if (FAILED(widgetAccessibilityNotSupported(&old_value))) {
+                return;
+            }
+            if (after_present) {
+                new_value.vt = VT_I4;
+                new_value.lVal = after;
+            } else if (FAILED(widgetAccessibilityNotSupported(&new_value))) {
+                VariantClear(&old_value);
+                return;
+            }
+            UiaRaiseAutomationPropertyChangedEvent(
+                static_cast<IRawElementProviderSimple *>(provider), property, old_value, new_value
+            );
+            VariantClear(&old_value);
+            VariantClear(&new_value);
+        };
+        auto raiseRectProperty = [](WidgetAccessibilityProvider *provider, PROPERTYID property,
+                                    const struct UiaRect &before, const struct UiaRect &after) {
+            auto makeRectVariant = [](const struct UiaRect &rect, VARIANT *value) {
+                VariantInit(value);
+                value->vt = VT_ARRAY | VT_R8;
+                value->parray = SafeArrayCreateVector(VT_R8, 0, 4);
+                if (!value->parray) return false;
+                const double coordinates[4] = { rect.left, rect.top, rect.width, rect.height };
+                for (LONG index = 0; index < 4; ++index) {
+                    if (FAILED(SafeArrayPutElement(value->parray, &index, const_cast<double *>(&coordinates[index])))) {
+                        VariantClear(value);
+                        return false;
+                    }
+                }
+                return true;
+            };
+            VARIANT old_value;
+            VARIANT new_value;
+            if (!makeRectVariant(before, &old_value)) return;
+            if (!makeRectVariant(after, &new_value)) {
+                VariantClear(&old_value);
+                return;
+            }
+            UiaRaiseAutomationPropertyChangedEvent(
+                static_cast<IRawElementProviderSimple *>(provider), property, old_value, new_value
+            );
+            VariantClear(&old_value);
+            VariantClear(&new_value);
+        };
+        static const PROPERTYID availability_properties[] = {
+            UIA_IsInvokePatternAvailablePropertyId,
+            UIA_IsValuePatternAvailablePropertyId,
+            UIA_IsRangeValuePatternAvailablePropertyId,
+            UIA_IsTogglePatternAvailablePropertyId,
+            UIA_IsSelectionPatternAvailablePropertyId,
+            UIA_IsSelectionItemPatternAvailablePropertyId,
+            UIA_IsExpandCollapsePatternAvailablePropertyId,
+            UIA_IsGridPatternAvailablePropertyId,
+            UIA_IsGridItemPatternAvailablePropertyId,
+            UIA_IsTextPatternAvailablePropertyId,
+            UIA_IsTextEditPatternAvailablePropertyId,
+            UIA_IsScrollPatternAvailablePropertyId,
+            UIA_IsScrollItemPatternAvailablePropertyId,
+        };
         for (const NodeDelta &delta : deltas) {
             if (delta.before.role != delta.after.role) {
                 raiseIntProperty(
@@ -2842,8 +3105,28 @@ public:
             const bool before_enabled = (delta.before.state_flags & kWidgetStateEnabled) != 0;
             const bool after_enabled = (delta.after.state_flags & kWidgetStateEnabled) != 0;
             if (before_enabled != after_enabled) raiseBoolProperty(delta.provider, UIA_IsEnabledPropertyId, before_enabled, after_enabled);
+            const bool before_required = (delta.before.state_flags & kWidgetStateRequired) != 0;
+            const bool after_required = (delta.after.state_flags & kWidgetStateRequired) != 0;
+            if (before_required != after_required) {
+                raiseBoolProperty(delta.provider, UIA_IsRequiredForFormPropertyId, before_required, after_required);
+            }
+            const bool before_valid = (delta.before.state_flags & kWidgetStateInvalid) == 0;
+            const bool after_valid = (delta.after.state_flags & kWidgetStateInvalid) == 0;
+            if (before_valid != after_valid) {
+                raiseBoolProperty(delta.provider, UIA_IsDataValidForFormPropertyId, before_valid, after_valid);
+            }
             if (delta.before.focusable != delta.after.focusable) {
                 raiseBoolProperty(delta.provider, UIA_IsKeyboardFocusablePropertyId, delta.before.focusable, delta.after.focusable);
+            }
+            if (delta.has_before_geometry && delta.has_after_geometry) {
+                if (!widgetAccessibilitySameRect(delta.before_bounds, delta.after_bounds)) {
+                    raiseRectProperty(delta.provider, UIA_BoundingRectanglePropertyId,
+                                      delta.before_bounds, delta.after_bounds);
+                }
+                if (delta.before_offscreen != delta.after_offscreen) {
+                    raiseBoolProperty(delta.provider, UIA_IsOffscreenPropertyId,
+                                      delta.before_offscreen, delta.after_offscreen);
+                }
             }
             const bool before_read_only = (delta.before.state_flags & kWidgetStateReadOnly) != 0;
             const bool after_read_only = (delta.after.state_flags & kWidgetStateReadOnly) != 0;
@@ -2926,17 +3209,89 @@ public:
             if (delta.before.placeholder != delta.after.placeholder) {
                 raiseStringProperty(delta.provider, UIA_HelpTextPropertyId, delta.before.placeholder, delta.after.placeholder);
             }
-            if (delta.before.has_list_item_index && delta.after.has_list_item_index &&
-                delta.before.list_item_index != delta.after.list_item_index) {
-                raiseIntProperty(delta.provider, UIA_PositionInSetPropertyId,
-                    (int)delta.before.list_item_index + 1, (int)delta.after.list_item_index + 1);
+            if (delta.before.has_list_item_index != delta.after.has_list_item_index ||
+                (delta.before.has_list_item_index &&
+                 delta.before.list_item_index != delta.after.list_item_index)) {
+                raiseOptionalIntProperty(delta.provider, UIA_PositionInSetPropertyId,
+                    delta.before.has_list_item_index, (int)delta.before.list_item_index + 1,
+                    delta.after.has_list_item_index, (int)delta.after.list_item_index + 1);
             }
-            if (delta.before.has_list_item_count && delta.after.has_list_item_count &&
-                delta.before.list_item_count != delta.after.list_item_count) {
-                raiseIntProperty(delta.provider, UIA_SizeOfSetPropertyId,
-                    (int)delta.before.list_item_count, (int)delta.after.list_item_count);
+            if (delta.before.has_list_item_count != delta.after.has_list_item_count ||
+                (delta.before.has_list_item_count &&
+                 delta.before.list_item_count != delta.after.list_item_count)) {
+                raiseOptionalIntProperty(delta.provider, UIA_SizeOfSetPropertyId,
+                    delta.before.has_list_item_count, (int)delta.before.list_item_count,
+                    delta.after.has_list_item_count, (int)delta.after.list_item_count);
+            }
+            if (delta.before.has_grid_row_index != delta.after.has_grid_row_index ||
+                (delta.before.has_grid_row_index &&
+                 delta.before.grid_row_index != delta.after.grid_row_index)) {
+                raiseOptionalIntProperty(delta.provider, UIA_GridItemRowPropertyId,
+                    delta.before.has_grid_row_index, (int)delta.before.grid_row_index,
+                    delta.after.has_grid_row_index, (int)delta.after.grid_row_index);
+            }
+            if (delta.before.has_grid_column_index != delta.after.has_grid_column_index ||
+                (delta.before.has_grid_column_index &&
+                 delta.before.grid_column_index != delta.after.grid_column_index)) {
+                raiseOptionalIntProperty(delta.provider, UIA_GridItemColumnPropertyId,
+                    delta.before.has_grid_column_index, (int)delta.before.grid_column_index,
+                    delta.after.has_grid_column_index, (int)delta.after.grid_column_index);
+            }
+            if (delta.before.has_grid_row_count != delta.after.has_grid_row_count ||
+                (delta.before.has_grid_row_count &&
+                 delta.before.grid_row_count != delta.after.grid_row_count)) {
+                raiseOptionalIntProperty(delta.provider, UIA_GridRowCountPropertyId,
+                    delta.before.has_grid_row_count, (int)delta.before.grid_row_count,
+                    delta.after.has_grid_row_count, (int)delta.after.grid_row_count);
+            }
+            if (delta.before.has_grid_column_count != delta.after.has_grid_column_count ||
+                (delta.before.has_grid_column_count &&
+                 delta.before.grid_column_count != delta.after.grid_column_count)) {
+                raiseOptionalIntProperty(delta.provider, UIA_GridColumnCountPropertyId,
+                    delta.before.has_grid_column_count, (int)delta.before.grid_column_count,
+                    delta.after.has_grid_column_count, (int)delta.after.grid_column_count);
+            }
+            for (PROPERTYID property : availability_properties) {
+                const PATTERNID pattern = widgetAccessibilityPatternForAvailabilityProperty(property);
+                const bool before = widgetAccessibilityPatternAvailable(pattern, delta.before, previous);
+                const bool after = widgetAccessibilityPatternAvailable(pattern, delta.after, next);
+                if (before != after) raiseBoolProperty(delta.provider, property, before, after);
+            }
+            const bool before_scroll = widgetAccessibilityPatternAvailable(UIA_ScrollPatternId, delta.before, previous);
+            const bool after_scroll = widgetAccessibilityPatternAvailable(UIA_ScrollPatternId, delta.after, next);
+            if (before_scroll && after_scroll) {
+                const WidgetAccessibilityScrollProperties before = widgetAccessibilityScrollProperties(delta.before);
+                const WidgetAccessibilityScrollProperties after = widgetAccessibilityScrollProperties(delta.after);
+                if (before.horizontal_percent != after.horizontal_percent) {
+                    raiseDoubleProperty(delta.provider, UIA_ScrollHorizontalScrollPercentPropertyId,
+                                        before.horizontal_percent, after.horizontal_percent);
+                }
+                if (before.horizontal_view_size != after.horizontal_view_size) {
+                    raiseDoubleProperty(delta.provider, UIA_ScrollHorizontalViewSizePropertyId,
+                                        before.horizontal_view_size, after.horizontal_view_size);
+                }
+                if (before.horizontally_scrollable != after.horizontally_scrollable) {
+                    raiseBoolProperty(delta.provider, UIA_ScrollHorizontallyScrollablePropertyId,
+                                      before.horizontally_scrollable, after.horizontally_scrollable);
+                }
+                if (before.vertical_percent != after.vertical_percent) {
+                    raiseDoubleProperty(delta.provider, UIA_ScrollVerticalScrollPercentPropertyId,
+                                        before.vertical_percent, after.vertical_percent);
+                }
+                if (before.vertical_view_size != after.vertical_view_size) {
+                    raiseDoubleProperty(delta.provider, UIA_ScrollVerticalViewSizePropertyId,
+                                        before.vertical_view_size, after.vertical_view_size);
+                }
+                if (before.vertically_scrollable != after.vertically_scrollable) {
+                    raiseBoolProperty(delta.provider, UIA_ScrollVerticallyScrollablePropertyId,
+                                      before.vertically_scrollable, after.vertically_scrollable);
+                }
             }
             delta.provider->Release();
+        }
+        for (IRawElementProviderSimple *sender : layout_senders) {
+            UiaRaiseAutomationEvent(sender, UIA_LayoutInvalidatedEventId);
+            sender->Release();
         }
         for (const StructureDelta &delta : structure_deltas) {
             const bool child_removed = delta.type == StructureChangeType_ChildRemoved;
