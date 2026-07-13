@@ -279,6 +279,9 @@ fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.B
         app_mod.linkSystemLibrary("comctl32", .{});
         app_mod.linkSystemLibrary("ole32", .{});
         app_mod.linkSystemLibrary("oleacc", .{});
+        app_mod.linkSystemLibrary("oleaut32", .{});
+        app_mod.linkSystemLibrary("uiautomationcore", .{});
+        app_mod.linkSystemLibrary("usp10", .{});
         app_mod.linkSystemLibrary("shell32", .{});
         // The audio backend: Media Foundation (session + source resolver
         // + streaming audio renderer) and WinHTTP (the cache fill).
