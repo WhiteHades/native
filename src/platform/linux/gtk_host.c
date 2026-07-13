@@ -22,6 +22,7 @@ typedef struct _WebKitUserContentManager WebKitUserContentManager;
 #define NATIVE_SDK_MAX_NATIVE_VIEWS 32
 #define NATIVE_SDK_MAX_SHORTCUTS 64
 #define NATIVE_SDK_MAX_MENU_ITEMS 128
+#define NATIVE_SDK_MAX_WIDGET_ACCESSIBILITY_NODES 64
 
 /* Tall hidden-titlebar band floor in logical pixels: the same 52 the
  * macOS host's unified-toolbar band settles at, so a toolbar-height app
@@ -97,6 +98,37 @@ typedef struct native_sdk_gtk_webview {
     WebKitUserContentManager *content_manager;
 } native_sdk_gtk_webview_t;
 
+typedef struct native_sdk_gtk_accessibility_proxy {
+    uint64_t id;
+    uint64_t parent_id;
+    int has_parent_id;
+    int role;
+    uint32_t state_flags;
+    uint32_t action_flags;
+    double value;
+    int has_value;
+    double x;
+    double y;
+    double width;
+    double height;
+    int seen;
+    GtkWidget *widget;
+    struct native_sdk_gtk_native_view *view;
+} native_sdk_gtk_accessibility_proxy_t;
+
+typedef struct _NativeSdkGtkAccessibilityWidget {
+    GtkWidget parent_instance;
+} NativeSdkGtkAccessibilityWidget;
+
+typedef struct _NativeSdkGtkAccessibilityWidgetClass {
+    GtkWidgetClass parent_class;
+} NativeSdkGtkAccessibilityWidgetClass;
+
+GType native_sdk_gtk_accessibility_widget_get_type(void);
+
+#define NATIVE_SDK_GTK_TYPE_ACCESSIBILITY_WIDGET (native_sdk_gtk_accessibility_widget_get_type())
+#define NATIVE_SDK_GTK_IS_ACCESSIBILITY_WIDGET(widget) (G_TYPE_CHECK_INSTANCE_TYPE((widget), NATIVE_SDK_GTK_TYPE_ACCESSIBILITY_WIDGET))
+
 typedef struct native_sdk_gtk_native_view {
     char *label;
     char *parent;
@@ -162,6 +194,9 @@ typedef struct native_sdk_gtk_native_view {
     native_sdk_gtk_drag_region_t *drag_regions;
     size_t drag_region_count;
     int gpu_drag_claimed_press;
+    int accessibility_updating;
+    int accessibility_keyboard_focus_pending;
+    native_sdk_gtk_accessibility_proxy_t accessibility_nodes[NATIVE_SDK_MAX_WIDGET_ACCESSIBILITY_NODES];
 } native_sdk_gtk_native_view_t;
 
 typedef struct native_sdk_gtk_app_timer {
@@ -1228,6 +1263,9 @@ static gboolean native_sdk_gpu_key_event(native_sdk_gtk_native_view_t *view, gui
     }
 
     if ((!key || !key[0]) && !text_buffer[0]) return FALSE;
+    if (input_kind == NATIVE_SDK_GTK_GPU_INPUT_KEY_DOWN && key && strcmp(key, "tab") == 0) {
+        view->accessibility_keyboard_focus_pending = 1;
+    }
     const uint32_t modifiers = native_sdk_gpu_modifier_flags(state);
     native_sdk_emit_gpu_surface_input(view, input_kind, view->gpu_pointer_x, view->gpu_pointer_y, 0, 0, 0, key, text_buffer, modifiers);
     return TRUE;
@@ -1430,6 +1468,512 @@ static void native_sdk_configure_native_view_action(native_sdk_gtk_native_view_t
     }
 }
 
+static void native_sdk_emit_widget_accessibility_action(native_sdk_gtk_accessibility_proxy_t *proxy, int action, const char *text, int has_selection, size_t selection_start, size_t selection_end) {
+    if (!proxy || !proxy->view || !proxy->view->window) return;
+    native_sdk_gtk_native_view_t *view = proxy->view;
+    native_sdk_emit(view->window->host, (native_sdk_gtk_event_t){
+        .kind = NATIVE_SDK_GTK_EVENT_WIDGET_ACCESSIBILITY_ACTION,
+        .window_id = view->window->id,
+        .view_label = view->label ? view->label : "",
+        .view_label_len = view->label ? strlen(view->label) : 0,
+        .widget_id = proxy->id,
+        .widget_action = action,
+        .widget_text = text ? text : "",
+        .widget_text_len = text ? strlen(text) : 0,
+        .has_widget_text_selection = has_selection,
+        .widget_text_selection_start = selection_start,
+        .widget_text_selection_end = selection_end,
+    });
+}
+
+G_DEFINE_TYPE(NativeSdkGtkAccessibilityWidget, native_sdk_gtk_accessibility_widget, GTK_TYPE_WIDGET)
+
+static void native_sdk_widget_accessibility_activate(GtkWidget *widget, const char *action_name, GVariant *parameter) {
+    (void)action_name;
+    (void)parameter;
+    native_sdk_gtk_accessibility_proxy_t *proxy = g_object_get_data(G_OBJECT(widget), "native-sdk-accessibility-proxy");
+    if (!proxy || !proxy->view || proxy->view->accessibility_updating) return;
+    int action = NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_PRESS;
+    if (proxy->action_flags & NATIVE_SDK_GTK_WIDGET_ACTION_SELECT) {
+        action = NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_SELECT;
+    } else if (proxy->action_flags & NATIVE_SDK_GTK_WIDGET_ACTION_TOGGLE) {
+        action = NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_TOGGLE;
+    } else if (!(proxy->action_flags & NATIVE_SDK_GTK_WIDGET_ACTION_PRESS)) {
+        return;
+    }
+    native_sdk_emit_widget_accessibility_action(proxy, action, "", 0, 0, 0);
+}
+
+static int native_sdk_widget_accessibility_allocation_coord(double value) {
+    if (value <= (double)INT_MIN) return INT_MIN;
+    if (value >= (double)INT_MAX) return INT_MAX;
+    return (int)floor(value);
+}
+
+static int native_sdk_widget_accessibility_allocation_extent(double value) {
+    if (value <= 0) return 0;
+    if (value >= (double)INT_MAX) return INT_MAX;
+    return (int)ceil(value);
+}
+
+static void native_sdk_gtk_accessibility_widget_measure(GtkWidget *widget, GtkOrientation orientation, int for_size, int *minimum, int *natural, int *minimum_baseline, int *natural_baseline) {
+    (void)widget;
+    (void)orientation;
+    (void)for_size;
+    *minimum = 0;
+    *natural = 0;
+    *minimum_baseline = -1;
+    *natural_baseline = -1;
+}
+
+static void native_sdk_gtk_accessibility_widget_size_allocate(GtkWidget *widget, int width, int height, int baseline) {
+    (void)width;
+    (void)height;
+    (void)baseline;
+    native_sdk_gtk_accessibility_proxy_t *parent_proxy = g_object_get_data(G_OBJECT(widget), "native-sdk-accessibility-proxy");
+    GtkWidget *child = gtk_widget_get_first_child(widget);
+    while (child) {
+        GtkWidget *next = gtk_widget_get_next_sibling(child);
+        native_sdk_gtk_accessibility_proxy_t *child_proxy = g_object_get_data(G_OBJECT(child), "native-sdk-accessibility-proxy");
+        GtkAllocation allocation = {0, 0, 0, 0};
+        if (parent_proxy && child_proxy) {
+            const double relative_x = child_proxy->x - parent_proxy->x;
+            const double relative_y = child_proxy->y - parent_proxy->y;
+            allocation.x = native_sdk_widget_accessibility_allocation_coord(relative_x);
+            allocation.y = native_sdk_widget_accessibility_allocation_coord(relative_y);
+            allocation.width = native_sdk_widget_accessibility_allocation_extent(child_proxy->width);
+            allocation.height = native_sdk_widget_accessibility_allocation_extent(child_proxy->height);
+        }
+        gtk_widget_size_allocate(child, &allocation, -1);
+        child = next;
+    }
+}
+
+static void native_sdk_gtk_accessibility_widget_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
+    GtkWidget *child = gtk_widget_get_first_child(widget);
+    while (child) {
+        GtkWidget *next = gtk_widget_get_next_sibling(child);
+        gtk_widget_snapshot_child(widget, child, snapshot);
+        child = next;
+    }
+}
+
+static void native_sdk_gtk_accessibility_widget_dispose(GObject *object) {
+    GtkWidget *widget = GTK_WIDGET(object);
+    GtkWidget *child = gtk_widget_get_first_child(widget);
+    while (child) {
+        gtk_widget_unparent(child);
+        child = gtk_widget_get_first_child(widget);
+    }
+    G_OBJECT_CLASS(native_sdk_gtk_accessibility_widget_parent_class)->dispose(object);
+}
+
+static void native_sdk_gtk_accessibility_widget_class_init(NativeSdkGtkAccessibilityWidgetClass *klass) {
+    GObjectClass *object_class = G_OBJECT_CLASS(klass);
+    GtkWidgetClass *widget_class = GTK_WIDGET_CLASS(klass);
+    object_class->dispose = native_sdk_gtk_accessibility_widget_dispose;
+    widget_class->measure = native_sdk_gtk_accessibility_widget_measure;
+    widget_class->size_allocate = native_sdk_gtk_accessibility_widget_size_allocate;
+    widget_class->snapshot = native_sdk_gtk_accessibility_widget_snapshot;
+    gtk_widget_class_set_accessible_role(widget_class, GTK_ACCESSIBLE_ROLE_GROUP);
+    gtk_widget_class_install_action(widget_class, "native-sdk.activate", NULL, native_sdk_widget_accessibility_activate);
+}
+
+static void native_sdk_gtk_accessibility_widget_init(NativeSdkGtkAccessibilityWidget *widget) {
+    (void)widget;
+}
+
+static void native_sdk_widget_accessibility_text_changed(GtkEditable *editable, gpointer data) {
+    native_sdk_gtk_accessibility_proxy_t *proxy = data;
+    if (!proxy || !proxy->view || proxy->view->accessibility_updating || !(proxy->action_flags & NATIVE_SDK_GTK_WIDGET_ACTION_SET_TEXT)) return;
+    native_sdk_emit_widget_accessibility_action(proxy, NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_SET_TEXT, gtk_editable_get_text(editable), 0, 0, 0);
+}
+
+static void native_sdk_widget_accessibility_selection_changed(GObject *object, GParamSpec *pspec, gpointer data) {
+    (void)pspec;
+    native_sdk_gtk_accessibility_proxy_t *proxy = data;
+    if (!proxy || !proxy->view || proxy->view->accessibility_updating || !(proxy->action_flags & NATIVE_SDK_GTK_WIDGET_ACTION_SET_SELECTION)) return;
+    GtkEditable *editable = GTK_EDITABLE(object);
+    int start = 0;
+    int end = 0;
+    if (!gtk_editable_get_selection_bounds(editable, &start, &end)) start = end = gtk_editable_get_position(editable);
+    const char *text = gtk_editable_get_text(editable);
+    const size_t start_bytes = (size_t)(g_utf8_offset_to_pointer(text, start) - text);
+    const size_t end_bytes = (size_t)(g_utf8_offset_to_pointer(text, end) - text);
+    native_sdk_emit_widget_accessibility_action(proxy, NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_SET_SELECTION, "", 1, start_bytes, end_bytes);
+}
+
+static void native_sdk_widget_accessibility_value_changed(GtkRange *range, gpointer data) {
+    native_sdk_gtk_accessibility_proxy_t *proxy = data;
+    if (!proxy || !proxy->view || proxy->view->accessibility_updating) return;
+    const double next = gtk_range_get_value(range);
+    proxy->value = next;
+    char value[G_ASCII_DTOSTR_BUF_SIZE];
+    native_sdk_emit_widget_accessibility_action(proxy, NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_SET_VALUE, g_ascii_dtostr(value, sizeof(value), next), 0, 0, 0);
+}
+
+static void native_sdk_widget_accessibility_focus_enter(GtkEventControllerFocus *controller, gpointer data) {
+    (void)controller;
+    native_sdk_gtk_accessibility_proxy_t *proxy = data;
+    if (!proxy || !proxy->view || proxy->view->accessibility_updating || !(proxy->action_flags & NATIVE_SDK_GTK_WIDGET_ACTION_FOCUS)) return;
+    native_sdk_emit_widget_accessibility_action(proxy, NATIVE_SDK_GTK_WIDGET_ACCESSIBILITY_ACTION_FOCUS, "", 0, 0, 0);
+}
+
+static GtkAccessibleRole native_sdk_widget_accessibility_role(int role) {
+    switch (role) {
+        case 1: return GTK_ACCESSIBLE_ROLE_GROUP;
+        case 2: return GTK_ACCESSIBLE_ROLE_LABEL;
+        case 3: return GTK_ACCESSIBLE_ROLE_IMG;
+        case 4: return GTK_ACCESSIBLE_ROLE_BUTTON;
+        case 5: return GTK_ACCESSIBLE_ROLE_TEXT_BOX;
+        case 6: return GTK_ACCESSIBLE_ROLE_TOOLTIP;
+        case 7: return GTK_ACCESSIBLE_ROLE_DIALOG;
+        case 8: return GTK_ACCESSIBLE_ROLE_MENU;
+        case 9: return GTK_ACCESSIBLE_ROLE_MENU_ITEM;
+        case 10: return GTK_ACCESSIBLE_ROLE_LIST;
+        case 11: return GTK_ACCESSIBLE_ROLE_LIST_ITEM;
+        case 12: return GTK_ACCESSIBLE_ROLE_ROW;
+        case 13: return GTK_ACCESSIBLE_ROLE_GRID;
+        case 14: return GTK_ACCESSIBLE_ROLE_GRID_CELL;
+        case 15: return GTK_ACCESSIBLE_ROLE_TAB;
+        case 16: return GTK_ACCESSIBLE_ROLE_CHECKBOX;
+        case 17: return GTK_ACCESSIBLE_ROLE_SWITCH;
+        case 18: return GTK_ACCESSIBLE_ROLE_SLIDER;
+        case 19: return GTK_ACCESSIBLE_ROLE_PROGRESS_BAR;
+        case 20: return GTK_ACCESSIBLE_ROLE_RADIO;
+        default: return GTK_ACCESSIBLE_ROLE_NONE;
+    }
+}
+
+static GtkWidget *native_sdk_make_widget_accessibility_proxy(const native_sdk_gtk_widget_accessibility_node_t *node) {
+    if (!node) return NULL;
+    switch (node->role) {
+        case 5:
+            return g_object_new(GTK_TYPE_ENTRY, "accessible-role", GTK_ACCESSIBLE_ROLE_TEXT_BOX, NULL);
+        case 18: {
+            GtkWidget *scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 1, 0.01);
+            gtk_scale_set_draw_value(GTK_SCALE(scale), FALSE);
+            return scale;
+        }
+        case 19:
+            return gtk_progress_bar_new();
+        case 2:
+            return g_object_new(GTK_TYPE_LABEL, "accessible-role", GTK_ACCESSIBLE_ROLE_LABEL, NULL);
+        default:
+            return g_object_new(NATIVE_SDK_GTK_TYPE_ACCESSIBILITY_WIDGET, "accessible-role", native_sdk_widget_accessibility_role(node->role), NULL);
+    }
+}
+
+typedef struct native_sdk_gtk_accessibility_rect {
+    double x;
+    double y;
+    double width;
+    double height;
+} native_sdk_gtk_accessibility_rect_t;
+
+static size_t native_sdk_widget_accessibility_node_index(const native_sdk_gtk_widget_accessibility_node_t *nodes, size_t node_count, uint64_t id) {
+    if (!nodes || id == 0) return node_count;
+    for (size_t index = 0; index < node_count; index++) {
+        if (nodes[index].id == id) return index;
+    }
+    return node_count;
+}
+
+static int native_sdk_widget_accessibility_leaf_role(int role) {
+    return role == 2 || role == 5 || role == 18 || role == 19;
+}
+
+static int native_sdk_validate_widget_accessibility_tree(const native_sdk_gtk_widget_accessibility_node_t *nodes, size_t node_count) {
+    for (size_t index = 0; index < node_count; index++) {
+        const native_sdk_gtk_widget_accessibility_node_t *node = &nodes[index];
+        if (node->id == 0 || !isfinite(node->x) || !isfinite(node->y) || !isfinite(node->width) || !isfinite(node->height) || node->width < 0 || node->height < 0) return 0;
+        for (size_t duplicate = index + 1; duplicate < node_count; duplicate++) {
+            if (nodes[duplicate].id == node->id) return 0;
+        }
+        if (!node->has_parent_id) continue;
+        const size_t parent_index = native_sdk_widget_accessibility_node_index(nodes, node_count, node->parent_id);
+        if (parent_index == node_count || parent_index == index || native_sdk_widget_accessibility_leaf_role(nodes[parent_index].role)) return 0;
+        uint64_t parent_id = node->parent_id;
+        for (size_t depth = 0; depth < node_count; depth++) {
+            const size_t ancestor_index = native_sdk_widget_accessibility_node_index(nodes, node_count, parent_id);
+            if (ancestor_index == node_count) return 0;
+            if (!nodes[ancestor_index].has_parent_id) break;
+            parent_id = nodes[ancestor_index].parent_id;
+            if (parent_id == node->id || depth + 1 == node_count) return 0;
+        }
+    }
+    return 1;
+}
+
+static native_sdk_gtk_accessibility_rect_t native_sdk_widget_accessibility_intersection(native_sdk_gtk_accessibility_rect_t value, native_sdk_gtk_accessibility_rect_t clip) {
+    const double left = fmax(value.x, clip.x);
+    const double top = fmax(value.y, clip.y);
+    const double right = fmin(value.x + value.width, clip.x + clip.width);
+    const double bottom = fmin(value.y + value.height, clip.y + clip.height);
+    if (right <= left || bottom <= top) {
+        value.width = 0;
+        value.height = 0;
+        return value;
+    }
+    return (native_sdk_gtk_accessibility_rect_t){ .x = left, .y = top, .width = right - left, .height = bottom - top };
+}
+
+static native_sdk_gtk_accessibility_rect_t native_sdk_widget_accessibility_visible_rect(native_sdk_gtk_native_view_t *view, const native_sdk_gtk_widget_accessibility_node_t *nodes, size_t node_count, size_t node_index) {
+    const native_sdk_gtk_widget_accessibility_node_t *node = &nodes[node_index];
+    native_sdk_gtk_accessibility_rect_t rect = { .x = node->x, .y = node->y, .width = node->width, .height = node->height };
+    double canvas_width = native_sdk_gpu_surface_width(view);
+    double canvas_height = native_sdk_gpu_surface_height(view);
+    if (canvas_width <= 0) canvas_width = view->width;
+    if (canvas_height <= 0) canvas_height = view->height;
+    rect = native_sdk_widget_accessibility_intersection(rect, (native_sdk_gtk_accessibility_rect_t){ .x = 0, .y = 0, .width = fmax(0, canvas_width), .height = fmax(0, canvas_height) });
+
+    uint64_t parent_id = node->has_parent_id ? node->parent_id : 0;
+    for (size_t depth = 0; parent_id != 0 && depth < node_count; depth++) {
+        const size_t parent_index = native_sdk_widget_accessibility_node_index(nodes, node_count, parent_id);
+        if (parent_index == node_count) break;
+        const native_sdk_gtk_widget_accessibility_node_t *parent = &nodes[parent_index];
+        if (parent->has_scroll_offset || parent->has_scroll_viewport_extent || parent->has_scroll_content_extent) {
+            rect = native_sdk_widget_accessibility_intersection(rect, (native_sdk_gtk_accessibility_rect_t){ .x = parent->x, .y = parent->y, .width = parent->width, .height = parent->height });
+        }
+        parent_id = parent->has_parent_id ? parent->parent_id : 0;
+    }
+    return rect;
+}
+
+static native_sdk_gtk_accessibility_proxy_t *native_sdk_find_widget_accessibility_proxy(native_sdk_gtk_native_view_t *view, uint64_t id) {
+    if (!view || id == 0) return NULL;
+    for (size_t index = 0; index < NATIVE_SDK_MAX_WIDGET_ACCESSIBILITY_NODES; index++) {
+        if (view->accessibility_nodes[index].id == id) return &view->accessibility_nodes[index];
+    }
+    return NULL;
+}
+
+static void native_sdk_detach_widget_accessibility_proxy(native_sdk_gtk_accessibility_proxy_t *proxy) {
+    if (!proxy || !proxy->widget) return;
+    GtkWidget *parent = gtk_widget_get_parent(proxy->widget);
+    if (!parent) return;
+    if (NATIVE_SDK_GTK_IS_ACCESSIBILITY_WIDGET(parent)) {
+        gtk_widget_unparent(proxy->widget);
+    } else if (GTK_IS_OVERLAY(parent)) {
+        gtk_overlay_remove_overlay(GTK_OVERLAY(parent), proxy->widget);
+    } else {
+        gtk_widget_unparent(proxy->widget);
+    }
+}
+
+static void native_sdk_remove_widget_accessibility_proxy(native_sdk_gtk_accessibility_proxy_t *proxy) {
+    if (!proxy || !proxy->id) return;
+    if (proxy->widget) {
+        g_signal_handlers_disconnect_by_data(proxy->widget, proxy);
+        native_sdk_detach_widget_accessibility_proxy(proxy);
+        g_object_set_data(G_OBJECT(proxy->widget), "native-sdk-accessibility-proxy", NULL);
+        g_object_unref(proxy->widget);
+    }
+    memset(proxy, 0, sizeof(*proxy));
+}
+
+static void native_sdk_clear_widget_accessibility(native_sdk_gtk_native_view_t *view) {
+    if (!view) return;
+    for (size_t index = 0; index < NATIVE_SDK_MAX_WIDGET_ACCESSIBILITY_NODES; index++) {
+        native_sdk_remove_widget_accessibility_proxy(&view->accessibility_nodes[index]);
+    }
+}
+
+static native_sdk_gtk_accessibility_proxy_t *native_sdk_add_widget_accessibility_proxy(native_sdk_gtk_native_view_t *view, const native_sdk_gtk_widget_accessibility_node_t *node) {
+    if (!view || !view->window || !view->window->stack_root || !node || node->id == 0) return NULL;
+    native_sdk_gtk_accessibility_proxy_t *proxy = NULL;
+    for (size_t index = 0; index < NATIVE_SDK_MAX_WIDGET_ACCESSIBILITY_NODES; index++) {
+        if (view->accessibility_nodes[index].id == 0) {
+            proxy = &view->accessibility_nodes[index];
+            break;
+        }
+    }
+    if (!proxy) return NULL;
+    GtkWidget *widget = native_sdk_make_widget_accessibility_proxy(node);
+    if (!widget) return NULL;
+    proxy->id = node->id;
+    proxy->role = node->role;
+    proxy->widget = widget;
+    proxy->view = view;
+    g_object_ref_sink(widget);
+    g_object_set_data(G_OBJECT(widget), "native-sdk-accessibility-proxy", proxy);
+    gtk_widget_set_opacity(widget, 0.0);
+    gtk_widget_set_can_target(widget, FALSE);
+    gtk_widget_set_halign(widget, GTK_ALIGN_START);
+    gtk_widget_set_valign(widget, GTK_ALIGN_START);
+    if (NATIVE_SDK_GTK_IS_ACCESSIBILITY_WIDGET(widget)) {
+        gtk_widget_action_set_enabled(widget, "native-sdk.activate", FALSE);
+    } else if (GTK_IS_ENTRY(widget)) {
+        g_signal_connect(widget, "changed", G_CALLBACK(native_sdk_widget_accessibility_text_changed), proxy);
+        g_signal_connect(widget, "notify::cursor-position", G_CALLBACK(native_sdk_widget_accessibility_selection_changed), proxy);
+        g_signal_connect(widget, "notify::selection-bound", G_CALLBACK(native_sdk_widget_accessibility_selection_changed), proxy);
+    } else if (GTK_IS_RANGE(widget)) {
+        g_signal_connect(widget, "value-changed", G_CALLBACK(native_sdk_widget_accessibility_value_changed), proxy);
+    }
+    GtkEventController *focus = gtk_event_controller_focus_new();
+    g_signal_connect(focus, "enter", G_CALLBACK(native_sdk_widget_accessibility_focus_enter), proxy);
+    gtk_widget_add_controller(widget, focus);
+    GtkEventController *keys = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
+    g_signal_connect(keys, "key-pressed", G_CALLBACK(native_sdk_gpu_key_pressed), view);
+    g_signal_connect(keys, "key-released", G_CALLBACK(native_sdk_gpu_key_released), view);
+    gtk_widget_add_controller(widget, keys);
+    return proxy;
+}
+
+static int native_sdk_widget_accessibility_relation_value(size_t value, int one_based) {
+    if (value >= (size_t)INT_MAX) return INT_MAX;
+    return (int)value + one_based;
+}
+
+static void native_sdk_update_widget_accessibility_proxy(native_sdk_gtk_accessibility_proxy_t *proxy, const native_sdk_gtk_widget_accessibility_node_t *node, native_sdk_gtk_accessibility_rect_t rect) {
+    if (!proxy || !proxy->widget || !proxy->view || !node) return;
+    GtkWidget *widget = proxy->widget;
+    proxy->seen = 1;
+    proxy->has_parent_id = node->has_parent_id;
+    proxy->parent_id = node->parent_id;
+    proxy->state_flags = node->state_flags;
+    proxy->action_flags = node->action_flags;
+    proxy->has_value = node->has_value;
+    proxy->value = node->value;
+    proxy->x = rect.x;
+    proxy->y = rect.y;
+    proxy->width = rect.width;
+    proxy->height = rect.height;
+    gtk_widget_set_size_request(widget, native_sdk_widget_accessibility_allocation_extent(rect.width), native_sdk_widget_accessibility_allocation_extent(rect.height));
+    gtk_widget_set_sensitive(widget, (node->state_flags & NATIVE_SDK_GTK_WIDGET_STATE_ENABLED) != 0);
+    gtk_widget_set_focusable(widget, node->focusable != 0 || (node->action_flags & NATIVE_SDK_GTK_WIDGET_ACTION_FOCUS) != 0);
+    gtk_widget_set_visible(widget, TRUE);
+    if (NATIVE_SDK_GTK_IS_ACCESSIBILITY_WIDGET(widget)) {
+        gtk_widget_action_set_enabled(widget, "native-sdk.activate", (node->action_flags & (NATIVE_SDK_GTK_WIDGET_ACTION_PRESS | NATIVE_SDK_GTK_WIDGET_ACTION_TOGGLE | NATIVE_SDK_GTK_WIDGET_ACTION_SELECT)) != 0);
+    }
+
+    char *label = native_sdk_strndup(node->label ? node->label : "", node->label_len);
+    char *text = native_sdk_strndup(node->text_value ? node->text_value : "", node->text_value_len);
+    char *placeholder = native_sdk_strndup(node->placeholder ? node->placeholder : "", node->placeholder_len);
+    if (!label || !text || !placeholder) {
+        free(label);
+        free(text);
+        free(placeholder);
+        return;
+    }
+    gtk_accessible_update_property(GTK_ACCESSIBLE(widget),
+        GTK_ACCESSIBLE_PROPERTY_LABEL, label,
+        GTK_ACCESSIBLE_PROPERTY_PLACEHOLDER, placeholder,
+        GTK_ACCESSIBLE_PROPERTY_READ_ONLY, node->role == 19 || (node->state_flags & NATIVE_SDK_GTK_WIDGET_STATE_READ_ONLY) != 0,
+        GTK_ACCESSIBLE_PROPERTY_REQUIRED, (node->state_flags & NATIVE_SDK_GTK_WIDGET_STATE_REQUIRED) != 0,
+        -1);
+    gtk_accessible_update_state(GTK_ACCESSIBLE(widget),
+        GTK_ACCESSIBLE_STATE_DISABLED, (node->state_flags & NATIVE_SDK_GTK_WIDGET_STATE_ENABLED) == 0,
+        GTK_ACCESSIBLE_STATE_INVALID, (node->state_flags & NATIVE_SDK_GTK_WIDGET_STATE_INVALID) ? GTK_ACCESSIBLE_INVALID_TRUE : GTK_ACCESSIBLE_INVALID_FALSE,
+        -1);
+    if (node->state_flags & (NATIVE_SDK_GTK_WIDGET_STATE_EXPANDED | NATIVE_SDK_GTK_WIDGET_STATE_COLLAPSED)) {
+        gtk_accessible_update_state(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_STATE_EXPANDED, (node->state_flags & NATIVE_SDK_GTK_WIDGET_STATE_EXPANDED) != 0, -1);
+    } else {
+        gtk_accessible_reset_state(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_STATE_EXPANDED);
+    }
+    if (node->action_flags & NATIVE_SDK_GTK_WIDGET_ACTION_SELECT || node->role == 11 || node->role == 14 || node->role == 15 || node->role == 20) {
+        gtk_accessible_update_state(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_STATE_SELECTED, (node->state_flags & NATIVE_SDK_GTK_WIDGET_STATE_SELECTED) != 0, -1);
+    } else {
+        gtk_accessible_reset_state(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_STATE_SELECTED);
+    }
+    if (node->action_flags & (NATIVE_SDK_GTK_WIDGET_ACTION_PRESS | NATIVE_SDK_GTK_WIDGET_ACTION_TOGGLE)) {
+        gtk_accessible_update_state(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_STATE_PRESSED, (node->state_flags & NATIVE_SDK_GTK_WIDGET_STATE_PRESSED) ? GTK_ACCESSIBLE_TRISTATE_TRUE : GTK_ACCESSIBLE_TRISTATE_FALSE, -1);
+    } else {
+        gtk_accessible_reset_state(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_STATE_PRESSED);
+    }
+    if (node->role == 16 || node->role == 17 || node->role == 20) {
+        gtk_accessible_update_state(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_STATE_CHECKED,
+            (node->state_flags & NATIVE_SDK_GTK_WIDGET_STATE_SELECTED) ? GTK_ACCESSIBLE_TRISTATE_TRUE : GTK_ACCESSIBLE_TRISTATE_FALSE, -1);
+    }
+    if (node->has_value && (node->role == 18 || node->role == 19)) {
+        gtk_accessible_update_property(GTK_ACCESSIBLE(widget),
+            GTK_ACCESSIBLE_PROPERTY_VALUE_MIN, 0.0,
+            GTK_ACCESSIBLE_PROPERTY_VALUE_MAX, 1.0,
+            GTK_ACCESSIBLE_PROPERTY_VALUE_NOW, node->value,
+            -1);
+    } else {
+        gtk_accessible_reset_property(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_PROPERTY_VALUE_MIN);
+        gtk_accessible_reset_property(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_PROPERTY_VALUE_MAX);
+        gtk_accessible_reset_property(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_PROPERTY_VALUE_NOW);
+    }
+    if (node->has_list_item_index) gtk_accessible_update_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_POS_IN_SET, (int)node->list_item_index + 1, -1);
+    else gtk_accessible_reset_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_POS_IN_SET);
+    if (node->has_list_item_count) gtk_accessible_update_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_SET_SIZE, (int)node->list_item_count, -1);
+    else gtk_accessible_reset_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_SET_SIZE);
+    if (node->has_grid_row_index) gtk_accessible_update_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_ROW_INDEX, native_sdk_widget_accessibility_relation_value(node->grid_row_index, 1), -1);
+    else gtk_accessible_reset_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_ROW_INDEX);
+    if (node->has_grid_column_index) gtk_accessible_update_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_COL_INDEX, native_sdk_widget_accessibility_relation_value(node->grid_column_index, 1), -1);
+    else gtk_accessible_reset_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_COL_INDEX);
+    if (node->has_grid_row_count) gtk_accessible_update_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_ROW_COUNT, native_sdk_widget_accessibility_relation_value(node->grid_row_count, 0), -1);
+    else gtk_accessible_reset_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_ROW_COUNT);
+    if (node->has_grid_column_count) gtk_accessible_update_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_COL_COUNT, native_sdk_widget_accessibility_relation_value(node->grid_column_count, 0), -1);
+    else gtk_accessible_reset_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_COL_COUNT);
+
+    if (GTK_IS_ENTRY(widget)) {
+        gtk_entry_set_placeholder_text(GTK_ENTRY(widget), placeholder);
+        gtk_editable_set_editable(GTK_EDITABLE(widget), (node->action_flags & NATIVE_SDK_GTK_WIDGET_ACTION_SET_TEXT) != 0);
+        gtk_editable_set_text(GTK_EDITABLE(widget), text);
+        if (node->has_text_selection) {
+            const size_t text_len = strlen(text);
+            const size_t start = node->text_selection_start < text_len ? node->text_selection_start : text_len;
+            const size_t end = node->text_selection_end < text_len ? node->text_selection_end : text_len;
+            gtk_editable_select_region(GTK_EDITABLE(widget), (int)g_utf8_pointer_to_offset(text, text + start), (int)g_utf8_pointer_to_offset(text, text + end));
+        }
+    } else if (GTK_IS_LABEL(widget)) {
+        gtk_label_set_text(GTK_LABEL(widget), label);
+    } else if (GTK_IS_RANGE(widget) && node->has_value) {
+        gtk_range_set_value(GTK_RANGE(widget), node->value);
+    } else if (GTK_IS_PROGRESS_BAR(widget) && node->has_value) {
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(widget), node->value < 0 ? 0 : node->value > 1 ? 1 : node->value);
+    }
+    free(label);
+    free(text);
+    free(placeholder);
+}
+
+static int native_sdk_attach_widget_accessibility_proxy(native_sdk_gtk_accessibility_proxy_t *proxy) {
+    if (!proxy || !proxy->view || !proxy->view->window || !proxy->widget) return 0;
+    GtkWidget *target_parent = proxy->view->window->stack_root;
+    native_sdk_gtk_accessibility_proxy_t *parent_proxy = NULL;
+    if (proxy->has_parent_id) {
+        parent_proxy = native_sdk_find_widget_accessibility_proxy(proxy->view, proxy->parent_id);
+        if (!parent_proxy || !parent_proxy->widget || !NATIVE_SDK_GTK_IS_ACCESSIBILITY_WIDGET(parent_proxy->widget)) return 0;
+        target_parent = parent_proxy->widget;
+    }
+    if (gtk_widget_get_parent(proxy->widget) != target_parent) {
+        native_sdk_detach_widget_accessibility_proxy(proxy);
+        if (parent_proxy) {
+            gtk_widget_set_parent(proxy->widget, target_parent);
+        } else {
+            gtk_overlay_add_overlay(GTK_OVERLAY(target_parent), proxy->widget);
+        }
+    }
+    if (parent_proxy) {
+        gtk_widget_queue_allocate(target_parent);
+    } else {
+        gtk_widget_set_margin_start(proxy->widget, native_sdk_widget_accessibility_allocation_coord(proxy->view->x + proxy->x));
+        gtk_widget_set_margin_top(proxy->widget, native_sdk_widget_accessibility_allocation_coord(proxy->view->y + proxy->y));
+    }
+    return 1;
+}
+
+static void native_sdk_order_widget_accessibility_children(native_sdk_gtk_native_view_t *view, const native_sdk_gtk_widget_accessibility_node_t *nodes, size_t node_count) {
+    for (size_t parent_index = 0; parent_index < node_count; parent_index++) {
+        native_sdk_gtk_accessibility_proxy_t *parent = native_sdk_find_widget_accessibility_proxy(view, nodes[parent_index].id);
+        if (!parent || !parent->widget || !NATIVE_SDK_GTK_IS_ACCESSIBILITY_WIDGET(parent->widget)) continue;
+        GtkWidget *previous = NULL;
+        for (size_t child_index = 0; child_index < node_count; child_index++) {
+            if (!nodes[child_index].has_parent_id || nodes[child_index].parent_id != nodes[parent_index].id) continue;
+            native_sdk_gtk_accessibility_proxy_t *child = native_sdk_find_widget_accessibility_proxy(view, nodes[child_index].id);
+            if (!child || !child->widget || gtk_widget_get_parent(child->widget) != parent->widget) continue;
+            gtk_widget_insert_after(child->widget, parent->widget, previous);
+            previous = child->widget;
+        }
+        gtk_widget_queue_allocate(parent->widget);
+    }
+}
+
 static void native_sdk_reorder_overlays(native_sdk_gtk_window_t *win) {
     if (!win || !win->stack_root) return;
     int placed[NATIVE_SDK_MAX_WEBVIEWS] = {0};
@@ -1507,6 +2051,7 @@ static void native_sdk_clear_native_view(native_sdk_gtk_window_t *win, native_sd
         native_sdk_remove_native_children(win, label);
         free(label);
     }
+    native_sdk_clear_widget_accessibility(view);
     native_sdk_teardown_gpu_surface_view(view);
     if (view->widget) {
         if (view->action_handler != 0) {
@@ -3503,6 +4048,62 @@ int native_sdk_gtk_present_gpu_surface_pixels(native_sdk_gtk_host_t *host, uint6
      * placeholder pump — from here on frames exist only on demand. */
     view->gpu_presented = 1;
     native_sdk_gpu_surface_schedule_frame_emission(view);
+    return 1;
+}
+
+int native_sdk_gtk_update_widget_accessibility(native_sdk_gtk_host_t *host, uint64_t window_id, const char *label, size_t label_len, const native_sdk_gtk_widget_accessibility_node_t *nodes, size_t node_count) {
+    native_sdk_gtk_window_t *win = native_sdk_find_window(host, window_id);
+    char *label_copy = label_len > 0 ? native_sdk_strndup(label, label_len) : NULL;
+    native_sdk_gtk_native_view_t *view = native_sdk_find_native_view(win, label_copy);
+    free(label_copy);
+    if (!view || view->kind != NATIVE_SDK_GTK_VIEW_GPU_SURFACE || !view->widget) return 0;
+    if (node_count > NATIVE_SDK_MAX_WIDGET_ACCESSIBILITY_NODES || (node_count > 0 && !nodes)) return 0;
+    if (!native_sdk_validate_widget_accessibility_tree(nodes, node_count)) return 0;
+
+    view->accessibility_updating = 1;
+    for (size_t index = 0; index < NATIVE_SDK_MAX_WIDGET_ACCESSIBILITY_NODES; index++) view->accessibility_nodes[index].seen = 0;
+    native_sdk_gtk_accessibility_proxy_t *focused = NULL;
+    for (size_t index = 0; index < node_count; index++) {
+        const native_sdk_gtk_widget_accessibility_node_t *node = &nodes[index];
+        native_sdk_gtk_accessibility_proxy_t *proxy = native_sdk_find_widget_accessibility_proxy(view, node->id);
+        if (proxy && proxy->role != node->role) {
+            native_sdk_remove_widget_accessibility_proxy(proxy);
+            proxy = NULL;
+        }
+        if (!proxy) proxy = native_sdk_add_widget_accessibility_proxy(view, node);
+        if (!proxy) {
+            view->accessibility_updating = 0;
+            return 0;
+        }
+        native_sdk_update_widget_accessibility_proxy(proxy, node, native_sdk_widget_accessibility_visible_rect(view, nodes, node_count, index));
+        if (node->state_flags & NATIVE_SDK_GTK_WIDGET_STATE_FOCUSED) focused = proxy;
+    }
+    for (size_t index = 0; index < NATIVE_SDK_MAX_WIDGET_ACCESSIBILITY_NODES; index++) {
+        native_sdk_gtk_accessibility_proxy_t *proxy = &view->accessibility_nodes[index];
+        if (proxy->id && !proxy->seen) native_sdk_remove_widget_accessibility_proxy(proxy);
+    }
+    for (size_t index = 0; index < node_count; index++) {
+        native_sdk_gtk_accessibility_proxy_t *proxy = native_sdk_find_widget_accessibility_proxy(view, nodes[index].id);
+        if (!native_sdk_attach_widget_accessibility_proxy(proxy)) {
+            view->accessibility_updating = 0;
+            return 0;
+        }
+    }
+    native_sdk_order_widget_accessibility_children(view, nodes, node_count);
+    if (focused && focused->widget) {
+        gtk_accessible_update_relation(GTK_ACCESSIBLE(view->widget), GTK_ACCESSIBLE_RELATION_ACTIVE_DESCENDANT, GTK_ACCESSIBLE(focused->widget), -1);
+        if (view->accessibility_keyboard_focus_pending) {
+            view->accessibility_keyboard_focus_pending = 0;
+            if (!gtk_widget_has_focus(focused->widget)) (void)gtk_widget_grab_focus(focused->widget);
+        }
+    } else {
+        gtk_accessible_reset_relation(GTK_ACCESSIBLE(view->widget), GTK_ACCESSIBLE_RELATION_ACTIVE_DESCENDANT);
+        GtkRoot *root = gtk_widget_get_root(view->widget);
+        GtkWidget *current = root ? gtk_root_get_focus(root) : NULL;
+        native_sdk_gtk_accessibility_proxy_t *current_proxy = current ? g_object_get_data(G_OBJECT(current), "native-sdk-accessibility-proxy") : NULL;
+        if (current_proxy && current_proxy->view == view) (void)gtk_widget_grab_focus(view->widget);
+    }
+    view->accessibility_updating = 0;
     return 1;
 }
 
