@@ -280,6 +280,93 @@ test "runtime dispatches canvas widget scroll events for wheel and kinetic scrol
     );
 }
 
+test "runtime dispatches typed accessibility scroll actions through retained scroll state" {
+    const TestApp = struct {
+        scroll_event_count: u32 = 0,
+        last_scroll: canvas.ScrollState = .{},
+
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "gpu-widget-accessibility-scroll", .source = platform.WebViewSource.html("<h1>Hello</h1>"), .event_fn = event };
+        }
+
+        fn event(context: *anyopaque, runtime: *Runtime, event_value: Event) anyerror!void {
+            _ = runtime;
+            const self: *@This() = @ptrCast(@alignCast(context));
+            switch (event_value) {
+                .canvas_widget_scroll => |scroll_event| {
+                    self.scroll_event_count += 1;
+                    self.last_scroll = scroll_event.scroll;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const harness = try TestHarness().create(std.testing.allocator, .{});
+    defer harness.destroy(std.testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+    var app_state: TestApp = .{};
+    const app = app_state.app();
+    try harness.start(app);
+
+    _ = try harness.runtime.createView(.{
+        .window_id = 1,
+        .label = "canvas",
+        .kind = .gpu_surface,
+        .frame = geometry.RectF.init(0, 0, 180, 80),
+    });
+
+    const children = [_]canvas.Widget{
+        .{ .id = 2, .kind = .button, .frame = geometry.RectF.init(0, 0, 0, 40), .text = "One" },
+        .{ .id = 3, .kind = .button, .frame = geometry.RectF.init(0, 80, 0, 40), .text = "Two" },
+        .{ .id = 4, .kind = .slider, .frame = geometry.RectF.init(0, 160, 0, 40), .text = "Volume" },
+    };
+    const scroll = canvas.Widget{ .id = 1, .kind = .scroll_view, .children = &children };
+    var nodes: [5]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(scroll, geometry.RectF.init(0, 0, 180, 80), &nodes);
+    _ = try harness.runtime.setCanvasWidgetLayout(1, "canvas", layout);
+
+    try std.testing.expectEqual(@as(c_int, 12), @intFromEnum(platform.WidgetAccessibilityActionKind.scroll_by));
+    try std.testing.expectEqual(@as(c_int, 13), @intFromEnum(platform.WidgetAccessibilityActionKind.scroll_to));
+
+    harness.runtime.invalidated = false;
+    try harness.runtime.dispatchPlatformEvent(app, .{ .widget_accessibility_action = .{
+        .window_id = 1,
+        .label = "canvas",
+        .id = 1,
+        .action = .scroll_by,
+        .text = "0.1",
+    } });
+    var retained = try harness.runtime.canvasWidgetLayout(1, "canvas");
+    try std.testing.expectEqual(@as(f32, 24), retained.findById(1).?.widget.value);
+    try std.testing.expectEqual(@as(f32, -24), retained.findById(2).?.frame.y);
+    try std.testing.expectEqual(@as(f32, 0), harness.runtime.views[0].widget_scroll_states[0].velocity);
+    try std.testing.expectEqual(@as(u32, 1), app_state.scroll_event_count);
+    try std.testing.expectEqual(@as(f32, 24), app_state.last_scroll.offset);
+    try std.testing.expect(harness.runtime.invalidated);
+    try std.testing.expect(harness.runtime.views[0].gpu_input_timestamp_ns > 0);
+    try std.testing.expectEqual(@as(canvas.ObjectId, 0), harness.runtime.views[0].canvas_widget_focused_id);
+
+    _ = try harness.runtime.dispatchCanvasWidgetAccessibilityAction(app, 1, "canvas", .{ .id = 1, .action = .scroll_by, .text = "-0.5" });
+    retained = try harness.runtime.canvasWidgetLayout(1, "canvas");
+    try std.testing.expectEqual(@as(f32, 0), retained.findById(1).?.widget.value);
+    try std.testing.expectEqual(@as(u32, 2), app_state.scroll_event_count);
+
+    harness.runtime.views[0].widget_scroll_states[0].velocity = 100;
+    _ = try harness.runtime.dispatchCanvasWidgetAccessibilityAction(app, 1, "canvas", .{ .id = 1, .action = .scroll_to, .text = "0.75" });
+    retained = try harness.runtime.canvasWidgetLayout(1, "canvas");
+    try std.testing.expectEqual(@as(f32, 90), retained.findById(1).?.widget.value);
+    try std.testing.expectEqual(@as(f32, 0), harness.runtime.views[0].widget_scroll_states[0].velocity);
+    try std.testing.expectEqual(@as(u32, 3), app_state.scroll_event_count);
+    try std.testing.expectEqual(@as(f32, 90), app_state.last_scroll.offset);
+
+    try std.testing.expectError(error.InvalidCommand, harness.runtime.dispatchCanvasWidgetAccessibilityAction(app, 1, "canvas", .{ .id = 1, .action = .scroll_by, .text = "nan" }));
+    try std.testing.expectError(error.InvalidCommand, harness.runtime.dispatchCanvasWidgetAccessibilityAction(app, 1, "canvas", .{ .id = 1, .action = .scroll_by, .text = "3.4e38" }));
+    try std.testing.expectError(error.InvalidCommand, harness.runtime.dispatchCanvasWidgetAccessibilityAction(app, 1, "canvas", .{ .id = 1, .action = .scroll_to, .text = "1.1" }));
+    try std.testing.expectError(error.InvalidCommand, harness.runtime.dispatchCanvasWidgetAccessibilityAction(app, 1, "canvas", .{ .id = 4, .action = .scroll_to, .text = "0.5" }));
+    try std.testing.expectEqual(@as(u32, 3), app_state.scroll_event_count);
+}
+
 test "runtime wheel input scrolls retained canvas scroll views" {
     const TestApp = struct {
         widget_pointer_count: u32 = 0,
@@ -1420,6 +1507,8 @@ test "runtime leaves virtualized canvas scroll views app driven" {
     try std.testing.expectEqual(@as(u64, 1), kinetic.widget_revision);
     try std.testing.expect(!harness.runtime.invalidated);
     try std.testing.expectEqual(@as(usize, 0), harness.runtime.pendingDirtyRegions().len);
+
+    try std.testing.expectError(error.InvalidCommand, harness.runtime.dispatchCanvasWidgetAccessibilityAction(app, 1, "canvas", .{ .id = 1, .action = .scroll_by, .text = "0.5" }));
 }
 
 test "user scroll offsets survive rebuilds until the source offset changes" {
