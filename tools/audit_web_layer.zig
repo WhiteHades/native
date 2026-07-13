@@ -14,6 +14,11 @@
 //! the section headers (the same dependency-free spirit as the PE sniff;
 //! package.zig `elfReferencesWebKitGtk` is the package-time twin).
 //!
+//! Mach-O (macOS): the system host links WebKit.framework directly, so
+//! its LC_LOAD_DYLIB family is authoritative. The native-only AppKit
+//! compile seam removes both those load commands and every WK* source
+//! reference; package.zig carries the package-time twin of this parser.
+//!
 //! The audit verifies the container format first so a wrong path can
 //! never "pass" by scanning the wrong kind of file.
 //!
@@ -53,7 +58,11 @@ pub fn main(init: std.process.Init) !void {
         auditElf(path, bytes, expect_present);
         return;
     }
-    std.debug.print("{s} is not a PE or ELF executable - the audit refuses to scan it\n", .{path});
+    if (isMachOExecutable(bytes)) {
+        auditMachO(path, bytes, expect_present);
+        return;
+    }
+    std.debug.print("{s} is not a PE, ELF, or 64-bit little-endian Mach-O executable - the audit refuses to scan it\n", .{path});
     std.process.exit(1);
 }
 
@@ -248,5 +257,92 @@ fn elfSlice(bytes: []const u8, offset: u64, size: u64) ElfError![]const u8 {
     if (offset > bytes.len) return error.TruncatedSection;
     const start: usize = @intCast(offset);
     if (size > bytes.len - start) return error.TruncatedSection;
+    return bytes[start .. start + @as(usize, @intCast(size))];
+}
+
+// ---------------------------------------------------------------------------
+// Mach-O: WebKit.framework load commands.
+// ---------------------------------------------------------------------------
+
+fn auditMachO(path: []const u8, bytes: []const u8, expect_present: bool) void {
+    const reference = scanMachOWebKitReference(bytes) catch |err| {
+        std.debug.print("{s} could not be scanned as Mach-O ({s}) - the audit refuses to guess\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+
+    if ((reference != null) == expect_present) {
+        if (reference) |found| {
+            std.debug.print("web-layer audit ok: {s} links WebKit ({s})\n", .{ path, found });
+        } else {
+            std.debug.print("web-layer audit ok: {s} links no WebKit framework\n", .{path});
+        }
+        return;
+    }
+    if (expect_present) {
+        std.debug.print("web-layer audit FAILED: {s} carries no WebKit load command but this app declares web use - the embedded web layer was compiled out of a web build\n", .{path});
+    } else {
+        std.debug.print("web-layer audit FAILED: {s} links WebKit ({s}) but nothing in its app.zon declares web use - the native-only inference did not strip the web layer\n", .{ path, reference.? });
+    }
+    std.process.exit(1);
+}
+
+const MachOError = error{
+    NotMachO64LittleEndian,
+    TruncatedHeader,
+    TruncatedLoadCommands,
+};
+
+const mach_o_64_little_magic = "\xcf\xfa\xed\xfe";
+
+fn isMachOExecutable(bytes: []const u8) bool {
+    return bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], mach_o_64_little_magic);
+}
+
+fn scanMachOWebKitReference(bytes: []const u8) MachOError!?[]const u8 {
+    if (!isMachOExecutable(bytes)) return error.NotMachO64LittleEndian;
+    if (bytes.len < 32) return error.TruncatedHeader;
+    const command_count = std.mem.readInt(u32, bytes[16..20], .little);
+    const command_bytes = std.mem.readInt(u32, bytes[20..24], .little);
+    const commands = try machoSlice(bytes, 32, command_bytes);
+
+    var cursor: usize = 0;
+    var index: u32 = 0;
+    while (index < command_count) : (index += 1) {
+        if (cursor + 8 > commands.len) return error.TruncatedLoadCommands;
+        const command = std.mem.readInt(u32, commands[cursor..][0..4], .little);
+        const command_size = std.mem.readInt(u32, commands[cursor + 4 ..][0..4], .little);
+        if (command_size < 8 or command_size > commands.len - cursor) return error.TruncatedLoadCommands;
+        const load_command = commands[cursor..][0..command_size];
+        if (isMachODylibLoadCommand(command)) {
+            if (load_command.len < 24) return error.TruncatedLoadCommands;
+            const name_offset = std.mem.readInt(u32, load_command[8..12], .little);
+            if (name_offset >= load_command.len) return error.TruncatedLoadCommands;
+            const name_start: usize = @intCast(name_offset);
+            const name_end = std.mem.indexOfScalarPos(u8, load_command, name_start, 0) orelse load_command.len;
+            const name = load_command[name_start..name_end];
+            if (std.mem.indexOf(u8, name, "WebKit.framework") != null) return name;
+        }
+        cursor += command_size;
+    }
+    if (cursor != commands.len) return error.TruncatedLoadCommands;
+    return null;
+}
+
+fn isMachODylibLoadCommand(command: u32) bool {
+    return switch (command) {
+        0x0c, // LC_LOAD_DYLIB
+        0x18 | 0x8000_0000, // LC_LOAD_WEAK_DYLIB
+        0x1f | 0x8000_0000, // LC_REEXPORT_DYLIB
+        0x20, // LC_LAZY_LOAD_DYLIB
+        0x23 | 0x8000_0000, // LC_LOAD_UPWARD_DYLIB
+        => true,
+        else => false,
+    };
+}
+
+fn machoSlice(bytes: []const u8, offset: u64, size: u64) MachOError![]const u8 {
+    if (offset > bytes.len) return error.TruncatedLoadCommands;
+    const start: usize = @intCast(offset);
+    if (size > bytes.len - start) return error.TruncatedLoadCommands;
     return bytes[start .. start + @as(usize, @intCast(size))];
 }
