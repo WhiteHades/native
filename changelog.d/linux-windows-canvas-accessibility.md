@@ -1,0 +1,1 @@
+feature: **Linux and Windows canvas accessibility**: GTK exposes canvas button, text, value, focus, action, and virtual-list metadata through AT-SPI, while Win32 publishes the same canonical semantics through a UI Automation fragment tree and routes assistive actions back into typed runtime events.
