@@ -81,6 +81,17 @@ test "virtual lesson semantics keep a stable two-level parent and bounded window
 
     const list_id = list.id;
     const lesson_42_id = lesson_42.id;
+    _ = try live.harness.runtime.dispatchCanvasWidgetAccessibilityAction(live.app, 1, main.canvas_label, .{
+        .id = list_id,
+        .action = .scroll_by,
+        .text = "0.85",
+    });
+    snapshot = live.snapshot();
+    try testing.expect(widgetNamed(snapshot, "listitem", "Lesson 40") == null);
+    try testing.expect(widgetNamed(snapshot, "listitem", "Lesson 48") != null);
+    try testing.expectEqual(list_id, widgetNamed(snapshot, "list", "Lesson list").?.id);
+    try testing.expectEqual(lesson_42_id, widgetNamed(snapshot, "listitem", "Lesson 42").?.id);
+
     try live.action(widgetNamed(snapshot, "button", "Count action").?.id, .press);
     snapshot = live.snapshot();
     try testing.expectEqual(list_id, widgetNamed(snapshot, "list", "Lesson list").?.id);
